@@ -394,6 +394,18 @@ The following module-related flags are **not supported** and will bypass the cac
 
 **GCC** and **MSVC** C++20 modules are not yet supported. Compilations using `-fmodules-ts` (GCC) or `/interface`, `/ifcOutput`, etc. (MSVC) will bypass the cache.
 
+### Precompiled headers
+
+sccache caches **MSVC** (`cl.exe` and `clang-cl`) compilations that create (`/Yc`) or use (`/Yu`) a precompiled header, including the `/Fp` PCH-path flag. Creating a PCH caches both the object file and the `.pch`; using a PCH content-hashes the consumed `.pch` so that the cache key tracks the exact header binary.
+
+The following cases intentionally **bypass the cache** (rather than risk an incorrect result):
+
+* The header-less `/Yc` / `/Yu` forms that rely on `#pragma hdrstop` to mark the PCH boundary.
+* A `/Fp` value that names a directory (MSVC then picks a toolset-version default name that cannot be predicted reliably).
+* A `/Yu` whose precompiled header file does not exist yet (the real compile would fail, so caching is refused).
+
+PCH compilations are cached **locally only**; they are not sent to distributed (`sccache-dist`) workers. Because MSVC `.pch` files are not byte-reproducible, a `/Yu` consumer only reuses a cached object when the matching `.pch` is itself restored from the cache (or left in place); a freshly recompiled `.pch` will produce a cache miss. **Clang** and **GCC** precompiled headers (e.g. `-include-pch`) continue to be cached as before.
+
 ### User Agent
 
 * Requests sent to your storage option of choice will have a user agent header indicating the current sccache version, e.g. `sccache/0.8.2`.

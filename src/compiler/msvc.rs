@@ -274,6 +274,10 @@ ArgData! {
     XClang(OsString), // -Xclang ...
     Clang(OsString), // -clang:...
     ExternalIncludePath(PathBuf),
+    ProducePch(PathBuf), // /Yc<header> - create a precompiled header.
+    UsePch(PathBuf), // /Yu<header> - use a precompiled header.
+    PchPath(PathBuf), // /Fp<path> - name of the precompiled header file.
+    DisablePch, // /Y- - disable all precompiled header options.
 }
 
 use self::ArgData::*;
@@ -315,7 +319,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("Fi", PathBuf, Concatenated, TooHardPath),
     msvc_take_arg!("Fm", PathBuf, Concatenated, PassThroughWithPath), // No effect if /c is specified.
     msvc_take_arg!("Fo", PathBuf, Concatenated, Output),
-    msvc_take_arg!("Fp", PathBuf, Concatenated, TooHardPath), // allows users to specify the name for a PCH (when using /Yu or /Yc), PCHs are not supported in sccache.
+    msvc_take_arg!("Fp", PathBuf, Concatenated, PchPath), // Specifies the precompiled header file name (used with /Yc or /Yu).
     msvc_take_arg!("Fr", PathBuf, Concatenated, TooHardPath),
     msvc_flag!("Fx", TooHardFlag),
     msvc_flag!("GA", PassThrough),
@@ -401,11 +405,12 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("Wv:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("X", PassThrough),
     msvc_take_arg!("Xclang", OsString, Separated, XClang),
-    msvc_flag!("Y-", PassThrough), // Disable another PCH options
+    msvc_flag!("Y-", DisablePch), // Disable all PCH options, overriding any /Yc or /Yu.
     msvc_take_arg!("YI", OsString, Concatenated, PassThroughWithSuffix), // Has no effect without /Yc
     msvc_flag!("YI-", PassThrough), // Has no effect without /Yc
-    msvc_take_arg!("Yc", PathBuf, Concatenated, TooHardPath), // Compile PCH - not yet supported.
+    msvc_take_arg!("Yc", PathBuf, Concatenated, ProducePch), // Create a precompiled header.
     msvc_flag!("Yd", PassThrough),
+    msvc_take_arg!("Yu", PathBuf, Concatenated, UsePch), // Use a precompiled header.
     msvc_flag!("Z7", PassThrough), // Add debug info to .obj files.
     msvc_take_arg!("ZH:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("ZI", DebugInfo), // Implies /FC, which puts absolute paths in error messages -> TooHardFlag?
@@ -516,8 +521,6 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("@", PathBuf, Concatenated, TooHardPath),
 ]);
 
-// TODO: what to do with precompiled header flags? eg: /Yc, /YI, /Yu
-
 pub fn parse_arguments(
     arguments: &[OsString],
     cwd: &Path,
@@ -537,6 +540,13 @@ pub fn parse_arguments(
     let mut pdb = None;
     let mut depfile = None;
     let mut show_includes = false;
+    // Precompiled header state: the header given to /Yc or /Yu, whether we are
+    // creating (/Yc) or using (/Yu) a PCH, the /Fp path, and whether /Y- was seen.
+    let mut pch_header: Option<PathBuf> = None;
+    let mut pch_create = false;
+    let mut pch_use = false;
+    let mut pch_path_arg: Option<PathBuf> = None;
+    let mut pch_disabled = false;
     let mut xclangs: Vec<OsString> = vec![];
     let mut clangs: Vec<OsString> = vec![];
     let mut profile_generate = false;
@@ -577,6 +587,16 @@ pub fn parse_arguments(
             Some(DepFile(p)) => depfile = Some(p.clone()),
             Some(ProgramDatabase(p)) => pdb = Some(p.clone()),
             Some(DebugInfo) => debug_info = true,
+            Some(ProducePch(header)) => {
+                pch_create = true;
+                pch_header = Some(header.clone());
+            }
+            Some(UsePch(header)) => {
+                pch_use = true;
+                pch_header = Some(header.clone());
+            }
+            Some(PchPath(path)) => pch_path_arg = Some(path.clone()),
+            Some(DisablePch) => pch_disabled = true,
             Some(PreprocessorArgument(_))
             | Some(PreprocessorArgumentPath(_))
             | Some(ExtraHashFile(_))
@@ -618,7 +638,11 @@ pub fn parse_arguments(
             | Some(DebugInfo)
             | Some(PassThrough)
             | Some(PassThroughWithPath(_))
-            | Some(PassThroughWithSuffix(_)) => common_args.extend(
+            | Some(PassThroughWithSuffix(_))
+            | Some(ProducePch(_))
+            | Some(UsePch(_))
+            | Some(PchPath(_))
+            | Some(DisablePch) => common_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -875,6 +899,73 @@ pub fn parse_arguments(
         };
     }
 
+    // Resolve precompiled header (PCH) handling. /Y- disables all PCH options, so
+    // when present we treat /Yc and /Yu as no-ops (they are still passed through to
+    // the compiler, which ignores them).
+    let mut too_hard_for_preprocessor_cache_mode = None;
+    if !pch_disabled && (pch_create || pch_use) {
+        if pch_create && pch_use {
+            cannot_cache!("both /Yc and /Yu");
+        }
+        // The header-less /Yc and /Yu forms rely on `#pragma hdrstop` to mark the
+        // PCH boundary, which we don't model; bail out for safety.
+        let header = pch_header.as_ref().expect("PCH mode implies a header arg");
+        if header.as_os_str().is_empty() {
+            cannot_cache!("precompiled header without a header name");
+        }
+        // Determine where the .pch lives. With /Fp it's the given path (defaulting
+        // the extension to .pch); without /Fp, MSVC names it <header-stem>.pch.
+        let pch_path = match &pch_path_arg {
+            Some(p) => {
+                if p.as_os_str().to_string_lossy().ends_with(['\\', '/']) {
+                    // A directory makes MSVC pick a toolset-version default name
+                    // (vcNNN.pch) that we can't reliably predict.
+                    cannot_cache!("precompiled header path is a directory");
+                }
+                if p.extension().is_none() {
+                    p.with_extension("pch")
+                } else {
+                    p.clone()
+                }
+            }
+            None => PathBuf::from(header.file_name().unwrap_or(header.as_os_str()))
+                .with_extension("pch"),
+        };
+        if pch_create {
+            // Creating a PCH also produces an object file (already an output). Cache
+            // the .pch next to it so a cache hit restores a usable header. Resolve
+            // against `cwd` before comparing so an absolute /Fp can't alias a
+            // relative /Fo (or another output) and slip past this check.
+            let resolved_pch = cwd.join(&pch_path);
+            if outputs.values().any(|o| cwd.join(&o.path) == resolved_pch) {
+                cannot_cache!("precompiled header path collides with another output");
+            }
+            outputs.insert(
+                "pch",
+                ArtifactDescriptor {
+                    path: pch_path,
+                    optional: false,
+                },
+            );
+            too_hard_for_preprocessor_cache_mode = Some("-Yc".into());
+        } else {
+            // Using a PCH: the compiler consumes the binary .pch, not the current
+            // header text, so its content must be part of the cache key. A missing
+            // PCH would fail the real compile, so refuse to cache rather than risk a
+            // misleading hit from preprocessed source alone.
+            let abs_pch = if pch_path.is_absolute() {
+                pch_path
+            } else {
+                cwd.join(&pch_path)
+            };
+            if !abs_pch.is_file() {
+                cannot_cache!("precompiled header file not found");
+            }
+            extra_hash_files.push(abs_pch);
+            too_hard_for_preprocessor_cache_mode = Some("-Yu".into());
+        }
+    }
+
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
         double_dash_input,
@@ -894,7 +985,7 @@ pub fn parse_arguments(
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
-        too_hard_for_preprocessor_cache_mode: None,
+        too_hard_for_preprocessor_cache_mode,
     })
 }
 
@@ -1145,34 +1236,52 @@ fn generate_compile_commands(
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
     #[cfg(feature = "dist-client")]
-    let dist_command = (|| {
-        // http://releases.llvm.org/6.0.0/tools/clang/docs/UsersManual.html#clang-cl
-        // TODO: Use /T... for language?
-        let mut fo = String::from("-Fo");
-        fo.push_str(&path_transformer.as_dist(out_file)?);
+    let dist_command = if uses_precompiled_header(parsed_args) {
+        // Precompiled-header compiles are not safe to distribute yet: a /Yu remote
+        // compile needs the .pch shipped as an input, and a /Yc remote compile from
+        // preprocessed source may not faithfully produce the .pch. Keep them local.
+        None
+    } else {
+        (|| {
+            // http://releases.llvm.org/6.0.0/tools/clang/docs/UsersManual.html#clang-cl
+            // TODO: Use /T... for language?
+            let mut fo = String::from("-Fo");
+            fo.push_str(&path_transformer.as_dist(out_file)?);
 
-        let mut arguments: Vec<String> =
-            vec![parsed_args.compilation_flag.clone().into_string().ok()?, fo];
-        // It's important to avoid preprocessor_args because of things like /FI which
-        // forcibly includes another file. This does mean we're potentially vulnerable
-        // to misidentification of flags like -DYNAMICBASE (though in that specific
-        // case we're safe as it only applies to link time, which sccache avoids).
-        arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
+            let mut arguments: Vec<String> =
+                vec![parsed_args.compilation_flag.clone().into_string().ok()?, fo];
+            // It's important to avoid preprocessor_args because of things like /FI which
+            // forcibly includes another file. This does mean we're potentially vulnerable
+            // to misidentification of flags like -DYNAMICBASE (though in that specific
+            // case we're safe as it only applies to link time, which sccache avoids).
+            arguments.extend(dist::osstrings_to_strings(&parsed_args.common_args)?);
 
-        if parsed_args.double_dash_input {
-            arguments.push("--".into());
-        }
-        arguments.push(path_transformer.as_dist(&parsed_args.input)?);
+            if parsed_args.double_dash_input {
+                arguments.push("--".into());
+            }
+            arguments.push(path_transformer.as_dist(&parsed_args.input)?);
 
-        Some(dist::CompileCommand {
-            executable: path_transformer.as_dist(executable)?,
-            arguments,
-            env_vars: dist::osstring_tuples_to_strings(env_vars)?,
-            cwd: path_transformer.as_dist(cwd)?,
-        })
-    })();
+            Some(dist::CompileCommand {
+                executable: path_transformer.as_dist(executable)?,
+                arguments,
+                env_vars: dist::osstring_tuples_to_strings(env_vars)?,
+                cwd: path_transformer.as_dist(cwd)?,
+            })
+        })()
+    };
 
     Ok((command, dist_command, cacheable))
+}
+
+/// Whether a parsed MSVC command creates (`/Yc`) or uses (`/Yu`) a precompiled
+/// header. Such compiles are cached locally but not distributed.
+#[cfg(feature = "dist-client")]
+fn uses_precompiled_header(parsed_args: &ParsedArguments) -> bool {
+    parsed_args.outputs.contains_key("pch")
+        || parsed_args.common_args.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.starts_with("-Yu") || arg.starts_with("/Yu")
+        })
 }
 
 /// Iterator that expands @response files in-place.
@@ -2371,15 +2480,226 @@ mod test {
             CompilerArguments::CannotCache("-FR", None),
             parse_arguments(ovec!["-c", "foo.c", "-FR", "-Fofoo.obj"])
         );
+    }
 
+    #[test]
+    fn test_parse_arguments_pch_create() {
+        let args = ovec![
+            "-c",
+            "-Ycstdafx.h",
+            "-Fpstdafx.pch",
+            "-Fostdafx.obj",
+            "stdafx.cpp"
+        ];
+        let ParsedArguments {
+            input,
+            outputs,
+            common_args,
+            extra_hash_files,
+            too_hard_for_preprocessor_cache_mode,
+            ..
+        } = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(Some("stdafx.cpp"), input.to_str());
+        // Creating a PCH caches both the object and the precompiled header.
         assert_eq!(
-            CompilerArguments::CannotCache("-Fp", None),
-            parse_arguments(ovec!["-c", "-Fpfoo.h", "foo.c"])
+            outputs.get("obj").map(|o| o.path.as_path()),
+            Some(Path::new("stdafx.obj"))
         );
-
         assert_eq!(
-            CompilerArguments::CannotCache("-Yc", None),
-            parse_arguments(ovec!["-c", "-Ycfoo.h", "foo.c"])
+            outputs.get("pch").map(|o| o.path.as_path()),
+            Some(Path::new("stdafx.pch"))
+        );
+        // /Yc and /Fp are passed through to the compiler and hashed.
+        assert_eq!(common_args, ovec!["-Ycstdafx.h", "-Fpstdafx.pch"]);
+        assert!(extra_hash_files.is_empty());
+        // Direct (preprocessor cache) mode is disabled for PCH compiles.
+        assert!(too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_create_default_name() {
+        // Without /Fp, MSVC names the PCH after the header: <header-stem>.pch.
+        let args = ovec!["-c", "-Ycstdafx.h", "-Fostdafx.obj", "stdafx.cpp"];
+        let parsed = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(
+            parsed.outputs.get("pch").map(|o| o.path.as_path()),
+            Some(Path::new("stdafx.pch"))
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_create_fp_no_extension() {
+        // /Fp without an extension gets a default .pch extension.
+        let args = ovec![
+            "-c",
+            "-Ycstdafx.h",
+            "-Fpcustom",
+            "-Fostdafx.obj",
+            "stdafx.cpp"
+        ];
+        let parsed = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(
+            parsed.outputs.get("pch").map(|o| o.path.as_path()),
+            Some(Path::new("custom.pch"))
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_use() {
+        // Using a PCH requires the .pch file to exist; it is content-hashed.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch")
+            .tempdir()
+            .unwrap();
+        let pch = tempdir.path().join("stdafx.pch");
+        std::fs::write(&pch, b"precompiled header bytes").unwrap();
+
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        let parsed = match super::parse_arguments(&args, tempdir.path(), false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(Some("foo.cpp"), parsed.input.to_str());
+        // Only the object is an output when using (not creating) a PCH.
+        assert_eq!(
+            parsed.outputs.get("obj").map(|o| o.path.as_path()),
+            Some(Path::new("foo.obj"))
+        );
+        assert!(!parsed.outputs.contains_key("pch"));
+        // The consumed PCH is content-hashed.
+        assert!(parsed.extra_hash_files.contains(&pch));
+        assert_eq!(parsed.common_args, ovec!["-Yustdafx.h", "-Fpstdafx.pch"]);
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_use_missing_is_not_cacheable() {
+        // A /Yu whose PCH does not exist would fail the real compile, so refuse to
+        // cache rather than risk a misleading hit from preprocessed source alone.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch")
+            .tempdir()
+            .unwrap();
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        assert_eq!(
+            CompilerArguments::CannotCache("precompiled header file not found", None),
+            super::parse_arguments(&args, tempdir.path(), false)
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_disabled_by_y_minus() {
+        // /Y- disables PCH options; no .pch output should be added.
+        let args = ovec![
+            "-c",
+            "-Ycstdafx.h",
+            "-Fpstdafx.pch",
+            "-Y-",
+            "-Fostdafx.obj",
+            "stdafx.cpp"
+        ];
+        let parsed = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(!parsed.outputs.contains_key("pch"));
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_none());
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_create_and_use_is_not_cacheable() {
+        assert_eq!(
+            CompilerArguments::CannotCache("both /Yc and /Yu", None),
+            parse_arguments(ovec![
+                "-c",
+                "-Ycstdafx.h",
+                "-Yustdafx.h",
+                "-Fpstdafx.pch",
+                "-Fofoo.obj",
+                "foo.cpp"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_bare_is_not_cacheable() {
+        // Header-less /Yc relies on `#pragma hdrstop`, which we don't model.
+        assert_eq!(
+            CompilerArguments::CannotCache("precompiled header without a header name", None),
+            parse_arguments(ovec!["-c", "-Yc", "-Fofoo.obj", "foo.cpp"])
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_fp_directory_is_not_cacheable() {
+        // A directory /Fp makes MSVC pick a toolset-version default name we cannot
+        // reliably predict.
+        assert_eq!(
+            CompilerArguments::CannotCache("precompiled header path is a directory", None),
+            parse_arguments(ovec![
+                "-c",
+                "-Ycstdafx.h",
+                "-Fpsub\\",
+                "-Fostdafx.obj",
+                "stdafx.cpp"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_collides_with_object_is_not_cacheable() {
+        // An absolute /Fp that resolves to the same file as the relative object
+        // output must be detected as a collision even though the raw strings differ.
+        let cwd = std::env::current_dir().unwrap();
+        let fp = format!("-Fp{}", cwd.join("stdafx.obj").display());
+        let args = ovec!["-c", "-Ycstdafx.h", &fp, "-Fostdafx.obj", "stdafx.cpp"];
+        assert_eq!(
+            CompilerArguments::CannotCache(
+                "precompiled header path collides with another output",
+                None
+            ),
+            super::parse_arguments(&args, &cwd, false)
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_create_clang() {
+        // clang-cl accepts the same spellings and is handled identically.
+        let args = ovec![
+            "-c",
+            "-Ycstdafx.h",
+            "-Fpstdafx.pch",
+            "-Fostdafx.obj",
+            "stdafx.cpp"
+        ];
+        let parsed = match parse_arguments_clang(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(
+            parsed.outputs.get("pch").map(|o| o.path.as_path()),
+            Some(Path::new("stdafx.pch"))
         );
     }
 

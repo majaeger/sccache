@@ -460,6 +460,138 @@ fn test_msvc_responsefile(compiler: Compiler, tempdir: &Path) {
     fs::remove_file(&out_file).unwrap();
 }
 
+fn test_msvc_pch(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch: {}", name);
+    zero_stats();
+
+    // A header, a source that creates the PCH (/Yc), and a source that uses it (/Yu).
+    let header = "pch_header.h";
+    let create_src = "pch_create.cpp";
+    let use_src = "pch_use.cpp";
+    write_source(tempdir, header, "#pragma once\nint helper(int x);\n");
+    write_source(
+        tempdir,
+        create_src,
+        "#include \"pch_header.h\"\nint helper(int x) { return x + 1; }\n",
+    );
+    write_source(
+        tempdir,
+        use_src,
+        "#include \"pch_header.h\"\nint use_helper() { return helper(41); }\n",
+    );
+
+    let pch = "test.pch";
+    let create_obj = "pch_create.obj";
+    let use_obj = "pch_use.obj";
+
+    let create_args = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            format!("-Yc{header}"),
+            format!("-Fp{pch}"),
+            format!("-Fo{create_obj}"),
+            create_src
+        )
+    };
+    let use_args = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            format!("-Yu{header}"),
+            format!("-Fp{pch}"),
+            format!("-Fo{use_obj}"),
+            use_src
+        )
+    };
+
+    // First build: both compiles are cache misses. The /Yc compile must run
+    // before the /Yu compile because the latter consumes the produced .pch.
+    sccache_command()
+        .args(create_args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    sccache_command()
+        .args(use_args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    // Creating a PCH produces both an object and the .pch; using it produces an object.
+    assert!(
+        fs::metadata(tempdir.join(create_obj))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+    assert!(
+        fs::metadata(tempdir.join(pch))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+    assert!(
+        fs::metadata(tempdir.join(use_obj))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+    get_stats(|info| {
+        assert_eq!(2, info.stats.compile_requests);
+        assert_eq!(0, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.cache_misses.all());
+        assert_eq!(&2, info.stats.cache_misses.get("C/C++").unwrap());
+    });
+
+    // Remove the produced artifacts and rebuild. Re-running /Yc first restores the
+    // cached .pch, so the subsequent /Yu compile finds it and also hits the cache.
+    fs::remove_file(tempdir.join(create_obj)).unwrap();
+    fs::remove_file(tempdir.join(use_obj)).unwrap();
+    fs::remove_file(tempdir.join(pch)).unwrap();
+    sccache_command()
+        .args(create_args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    sccache_command()
+        .args(use_args())
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    // The cached .pch and both objects are restored.
+    assert!(
+        fs::metadata(tempdir.join(create_obj))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+    assert!(
+        fs::metadata(tempdir.join(pch))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+    assert!(
+        fs::metadata(tempdir.join(use_obj))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+    get_stats(|info| {
+        assert_eq!(4, info.stats.compile_requests);
+        assert_eq!(2, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.cache_misses.all());
+        assert_eq!(&2, info.stats.cache_hits.get("C/C++").unwrap());
+    });
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -746,6 +878,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
     if compiler.name == "cl.exe" {
         test_msvc_deps(compiler.clone(), tempdir);
         test_msvc_responsefile(compiler.clone(), tempdir);
+        test_msvc_pch(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
