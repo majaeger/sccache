@@ -2704,6 +2704,61 @@ mod test {
     }
 
     #[test]
+    fn test_parse_arguments_pch_use_bare_is_not_cacheable() {
+        // Header-less /Yu relies on `#pragma hdrstop`, which we don't model.
+        assert_eq!(
+            CompilerArguments::CannotCache("precompiled header without a header name", None),
+            parse_arguments(ovec!["-c", "-Yu", "-Fofoo.obj", "foo.cpp"])
+        );
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_use_clang() {
+        // clang-cl uses the same /Yu + /Fp spellings and also content-hashes the PCH.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch")
+            .tempdir()
+            .unwrap();
+        let pch = tempdir.path().join("stdafx.pch");
+        std::fs::write(&pch, b"precompiled header bytes").unwrap();
+
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        let parsed = match super::parse_arguments(&args, tempdir.path(), true) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(!parsed.outputs.contains_key("pch"));
+        assert!(parsed.extra_hash_files.contains(&pch));
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_use_disabled_by_y_minus() {
+        // /Y- disables PCH use, so the (otherwise required) precompiled header is
+        // neither hashed nor checked for existence, even when it is missing.
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpdoes_not_exist.pch",
+            "-Y-",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        let parsed = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(parsed.extra_hash_files.is_empty());
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_none());
+    }
+
+    #[test]
     fn test_parse_arguments_cxx20_modules_unsupported() {
         // C++20 modules are not yet supported in MSVC mode
 
