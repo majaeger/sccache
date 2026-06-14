@@ -281,6 +281,7 @@ ArgData! {
     PchPath(PathBuf), // /Fp<path> - name of the precompiled header file.
     DisablePch, // /Y- - disable all precompiled header options.
     PathMap(OsString), // /pathmap:OLD=NEW - remap paths embedded in the output.
+    DynamicDeopt, // /dynamicdeopt - emits a companion <obj>.alt.obj to cache.
 }
 
 use self::ArgData::*;
@@ -449,6 +450,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("deps", PathBuf, Concatenated, DepFile),
     msvc_take_arg!("diagnostics:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("doc", PathBuf, Concatenated, TooHardPath), // Creates an .xdc file.
+    msvc_flag!("dynamicdeopt", DynamicDeopt), // Emits a companion <obj>.alt.obj.
     msvc_take_arg!("errorReport:", OsString, Concatenated, PassThroughWithSuffix), // Deprecated.
     msvc_take_arg!("execution-charset:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("experimental:deterministic", PassThrough),
@@ -567,6 +569,7 @@ pub fn parse_arguments(
     let mut show_includes = false;
     let mut pch = PchArgs::default();
     let mut pathmap_present = false;
+    let mut dynamic_deopt = false;
     let mut xclangs: Vec<OsString> = vec![];
     let mut clangs: Vec<OsString> = vec![];
     let mut profile_generate = false;
@@ -617,6 +620,7 @@ pub fn parse_arguments(
             }
             Some(PchPath(path)) => pch.fp_path = Some(path.clone()),
             Some(DisablePch) => pch.disabled = true,
+            Some(DynamicDeopt) => dynamic_deopt = true,
             Some(PreprocessorArgument(_))
             | Some(PreprocessorArgumentPath(_))
             | Some(ExtraHashFile(_))
@@ -660,7 +664,8 @@ pub fn parse_arguments(
             | Some(PassThrough)
             | Some(PassThroughWithPath(_))
             | Some(PassThroughWithSuffix(_))
-            | Some(DisablePch) => common_args.extend(
+            | Some(DisablePch)
+            | Some(DynamicDeopt) => common_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -907,6 +912,33 @@ pub fn parse_arguments(
             );
         }
     }
+    let mut too_hard_for_preprocessor_cache_mode = None;
+    // /dynamicdeopt makes the compiler emit a companion "deoptimized" object next
+    // to each .obj (<obj-stem>.alt.obj, e.g. foo.obj -> foo.alt.obj). Linking with
+    // /DYNAMICDEOPT /DEBUG:FULL requires it, so a cache hit that restored only the
+    // primary .obj would break the link (LNK1422 / LNK4312). Cache the companion
+    // too. It is only produced when the optimizer actually deoptimizes code (and
+    // needs /Z7 or /Zi), so it is optional: if absent it is simply not cached or
+    // restored, exactly matching what a real compile leaves behind.
+    if dynamic_deopt {
+        if let Some(obj) = outputs.get("obj") {
+            let alt_obj = obj.path.with_extension("alt.obj");
+            outputs.insert(
+                "alt_obj",
+                ArtifactDescriptor {
+                    path: alt_obj,
+                    optional: true,
+                },
+            );
+        }
+        // Disable preprocessor-cache (direct) mode for /dynamicdeopt. The schema
+        // marker that distinguishes new (companion-aware) entries from pre-change
+        // ones lives in the preprocessor output, which direct mode skips -- a stale
+        // direct-mode mapping from an older sccache could otherwise still route to a
+        // .alt.obj-less result. We take the same route PCH does and bypass direct
+        // mode here so the marker is always honored.
+        too_hard_for_preprocessor_cache_mode = Some("-dynamicdeopt".into());
+    }
     // -Fd is not taken into account unless -Zi or -ZI are given
     // Clang is currently unable to generate PDB files
     if debug_info && !is_clang {
@@ -940,7 +972,6 @@ pub fn parse_arguments(
 
     // Resolve precompiled-header handling. (/Y- disables /Yc and /Yu; they're still
     // passed to the compiler, which ignores them.)
-    let mut too_hard_for_preprocessor_cache_mode = None;
     if pch.is_active() {
         if pch.create && pch.use_pch {
             cannot_cache!("both /Yc and /Yu");
@@ -1186,6 +1217,20 @@ where
     // normalize the OLD prefix like any other path. Done before the early return
     // below so it also covers plain (non-PCH) compiles.
     append_pathmap_markers(&mut output.stdout, &parsed_args.unhashed_args);
+
+    // /dynamicdeopt makes cl emit a companion <obj>.alt.obj that older sccache
+    // versions didn't cache. Fold a schema marker into the hashed preprocessor
+    // output so these compiles get a distinct cache key and can't reuse a
+    // pre-change, .alt.obj-less entry (which would restore only the .obj and break
+    // a later /DYNAMICDEOPT link with LNK1422). The argv is unchanged -- the
+    // preprocessor output is the only hash input we can extend without altering it.
+    // This must run before the early return below so it also covers the common
+    // (non-PCH) /dynamicdeopt case.
+    if parsed_args.outputs.contains_key("alt_obj") {
+        output
+            .stdout
+            .extend_from_slice(b"\n// sccache-msvc-dynamicdeopt-v1\n");
+    }
 
     let creating_pch = parsed_args.outputs.contains_key("pch");
     // clang-cl writes its dependency file from the -showIncludes notes (cl.exe uses
@@ -2966,6 +3011,41 @@ mod test {
         };
         assert_eq!(digest_two("-Yca.h", "-Ycb.h"), digest("-Ycb.h", &[]));
         assert_ne!(digest_two("-Yca.h", "-Ycb.h"), digest("-Yca.h", &[]));
+    }
+
+    #[test]
+    fn test_parse_arguments_dynamicdeopt_caches_companion_obj() {
+        // /dynamicdeopt makes cl emit a companion <obj>.alt.obj that the linker
+        // needs under /DYNAMICDEOPT (LNK1422 otherwise). Cache it as an optional
+        // output so a cache hit restores it next to the .obj.
+        let args = ovec!["-c", "-Z7", "-O2", "-dynamicdeopt", "-Fofoo.obj", "foo.cpp"];
+        let parsed = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        let alt = parsed
+            .outputs
+            .get("alt_obj")
+            .expect("alt_obj companion output missing");
+        assert_eq!(alt.path.as_path(), Path::new("foo.alt.obj"));
+        // Conditionally produced (only when the optimizer deoptimizes), so optional.
+        assert!(alt.optional);
+        // The flag still reaches the compiler -- it changes codegen, so it is hashed.
+        assert!(parsed.common_args.iter().any(|a| a == "-dynamicdeopt"));
+        // Direct (preprocessor cache) mode is disabled so the dynamicdeopt schema
+        // marker folded into the preprocessor output can't be bypassed.
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    #[test]
+    fn test_parse_arguments_no_dynamicdeopt_has_no_companion() {
+        // Without /dynamicdeopt there is no companion object to cache.
+        let args = ovec!["-c", "-Z7", "-O2", "-Fofoo.obj", "foo.cpp"];
+        let parsed = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(!parsed.outputs.contains_key("alt_obj"));
     }
 
     #[test]

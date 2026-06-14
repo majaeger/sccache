@@ -1379,6 +1379,87 @@ fn test_msvc_pathmap(compiler: Compiler, tempdir: &Path) {
     });
 }
 
+// /dynamicdeopt makes cl emit a companion <obj>.alt.obj that the linker needs
+// under /DYNAMICDEOPT (LNK1422 otherwise). Verify sccache caches and restores it:
+// build (miss), delete the outputs, rebuild (hit), and confirm the companion
+// comes back. Robust across toolsets -- if this cl.exe doesn't emit a companion
+// (older MSVC, or nothing to deoptimize), it still checks the object hit and
+// skips the companion assertion.
+fn test_msvc_dynamicdeopt_companion_obj(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_dynamicdeopt_companion_obj: {}", name);
+
+    write_source(
+        tempdir,
+        "dd.cpp",
+        "__declspec(noinline) int dd_compute(int n){int s=0;for(int i=0;i<n;i++)s+=i*i;return s;}\n",
+    );
+    let obj = "dd.obj";
+    let alt = "dd.alt.obj";
+    let args = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-O2",
+            "-Z7",
+            "-dynamicdeopt",
+            "-Fodd.obj",
+            "dd.cpp"
+        )
+    };
+
+    // First build: a cold miss that produces the object (and, on a supporting
+    // toolset, the .alt.obj companion).
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    let produced_companion = fs::metadata(tempdir.join(alt))
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+
+    // Remove the outputs so the rebuild must restore them from the cache.
+    fs::remove_file(tempdir.join(obj)).unwrap();
+    if produced_companion {
+        fs::remove_file(tempdir.join(alt)).unwrap();
+    }
+
+    // Second build: a cache hit that restores the object -- and the companion, if
+    // the toolset produced one.
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+    assert!(
+        fs::metadata(tempdir.join(obj))
+            .map(|m| m.len() > 0)
+            .unwrap(),
+        "object not restored from cache"
+    );
+    if produced_companion {
+        assert!(
+            fs::metadata(tempdir.join(alt))
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
+            "/dynamicdeopt companion .alt.obj was not restored from cache"
+        );
+    }
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -1676,6 +1757,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_pch_use_missing_not_cacheable(compiler.clone(), tempdir);
         test_msvc_pch_cross_directory(compiler.clone(), tempdir);
         test_msvc_pathmap(compiler.clone(), tempdir);
+        test_msvc_dynamicdeopt_companion_obj(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
