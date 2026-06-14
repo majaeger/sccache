@@ -228,6 +228,7 @@ where
         extra_dist_files: extra_dist_files.clone(),
         extra_hash_files: extra_dist_files,
         msvc_show_includes: false,
+        pch_create_header: None,
         profile_generate: false,
         color_mode: ColorMode::Off,
         suppress_rewrite_includes_only: false,

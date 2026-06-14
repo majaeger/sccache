@@ -547,6 +547,7 @@ pub fn parse_arguments(
     let mut pch_use = false;
     let mut pch_path_arg: Option<PathBuf> = None;
     let mut pch_disabled = false;
+    let mut pch_create_header: Option<OsString> = None;
     let mut xclangs: Vec<OsString> = vec![];
     let mut clangs: Vec<OsString> = vec![];
     let mut profile_generate = false;
@@ -639,10 +640,20 @@ pub fn parse_arguments(
             | Some(PassThrough)
             | Some(PassThroughWithPath(_))
             | Some(PassThroughWithSuffix(_))
-            | Some(ProducePch(_))
-            | Some(UsePch(_))
-            | Some(PchPath(_))
             | Some(DisablePch) => common_args.extend(
+                arg.normalize(NormalizedDisposition::Concatenated)
+                    .iter_os_strings(),
+            ),
+            // /Yc, /Yu and /Fp carry paths that are absolute in real builds (CMake
+            // emits them under the build tree). Route them through unhashed_args so
+            // those paths stay out of the cache key -- otherwise a repo cloned to a
+            // different directory (SCCACHE_BASEDIRS) would never share PCH hits,
+            // since common_args is hashed verbatim while only preprocessor *output*
+            // is basedir-normalized. They still reach the real compile via
+            // unhashed_args. Their semantic effect is preserved in the key
+            // elsewhere: the consumed .pch is content-hashed for /Yu, and the
+            // created PCH's header contents + boundary are folded in for /Yc.
+            Some(ProducePch(_)) | Some(UsePch(_)) | Some(PchPath(_)) => unhashed_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -947,6 +958,11 @@ pub fn parse_arguments(
                     optional: false,
                 },
             );
+            // Record the boundary header so its (location-independent) identity is
+            // folded into the cache key. The preprocessed text is the same no matter
+            // which `#include` is the boundary, so without this two `/Yc` compiles of
+            // the same source at different boundaries would collide.
+            pch_create_header = Some(header.as_os_str().to_os_string());
             too_hard_for_preprocessor_cache_mode = Some("-Yc".into());
         } else {
             // Using a PCH: the compiler consumes the binary .pch, not the current
@@ -990,6 +1006,7 @@ pub fn parse_arguments(
         extra_dist_files: vec![],
         extra_hash_files,
         msvc_show_includes: show_includes,
+        pch_create_header,
         profile_generate,
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
@@ -1319,6 +1336,27 @@ fn append_pch_creation_state(
     for path in includes {
         digest.update(b"\0inc\0");
         digest.update(&read_file(Path::new(path)));
+    }
+    // The PCH boundary header's identity. `cl /EP` ignores `/Yc`, so the
+    // preprocessed text and the included-header set are identical no matter which
+    // `#include` is the boundary; without this, the same source precompiled at
+    // different boundaries (`/Yc a.h` vs `/Yc b.h`) would collide. We fold a
+    // location-independent form -- the path relative to `cwd` when the header lives
+    // under it (true for CMake, whose boundary sits in the build tree), else the
+    // basename -- so this never re-introduces an absolute path into the key.
+    // (Same-basename headers in different directories are still disambiguated by
+    // their contents, hashed just above.)
+    if let Some(header) = &parsed_args.pch_create_header {
+        let abs = cwd.join(header);
+        let token = match abs.strip_prefix(cwd) {
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => Path::new(header)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        };
+        digest.update(b"\0boundary\0");
+        digest.update(token.as_bytes());
     }
 
     stdout.extend_from_slice(b"\n// sccache-pch-state:");
@@ -2641,6 +2679,7 @@ mod test {
             input,
             outputs,
             common_args,
+            unhashed_args,
             extra_hash_files,
             too_hard_for_preprocessor_cache_mode,
             ..
@@ -2658,11 +2697,37 @@ mod test {
             outputs.get("pch").map(|o| o.path.as_path()),
             Some(Path::new("stdafx.pch"))
         );
-        // /Yc and /Fp are passed through to the compiler and hashed.
-        assert_eq!(common_args, ovec!["-Ycstdafx.h", "-Fpstdafx.pch"]);
+        // /Yc and /Fp reach the compiler via unhashed_args, not common_args, so
+        // their (in real builds absolute) paths stay out of the cache key and the
+        // key remains checkout-location-independent for SCCACHE_BASEDIRS sharing.
+        assert!(common_args.is_empty());
+        assert_eq!(unhashed_args, ovec!["-Ycstdafx.h", "-Fpstdafx.pch"]);
         assert!(extra_hash_files.is_empty());
         // Direct (preprocessor cache) mode is disabled for PCH compiles.
         assert!(too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    #[test]
+    fn test_parse_arguments_pch_absolute_paths_are_unhashed() {
+        // CMake emits /Yc, /Yu and /Fp as absolute paths under the build tree. They
+        // must reach the compiler via unhashed_args (NOT common_args, which is
+        // hashed verbatim) so the cache key stays checkout-location-independent and
+        // a repo cloned to a different directory still shares PCH hits under
+        // SCCACHE_BASEDIRS. The PCH's semantic content is captured separately (the
+        // boundary fold for /Yc, the .pch content-hash for /Yu), not via these paths.
+        let cwd = std::env::current_dir().unwrap();
+        let yc = format!("-Yc{}", cwd.join("cmake_pch.hxx").display());
+        let fp = format!("-Fp{}", cwd.join("cmake_pch.pch").display());
+        let args = ovec!["-c", &yc, &fp, "-Fopch.obj", "cmake_pch.cpp"];
+        let parsed = match super::parse_arguments(&args, &cwd, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        // No PCH path leaks into the hashed args.
+        assert!(parsed.common_args.is_empty());
+        assert_eq!(parsed.unhashed_args.len(), 2);
+        assert_eq!(parsed.unhashed_args[0].to_string_lossy(), yc);
+        assert_eq!(parsed.unhashed_args[1].to_string_lossy(), fp);
     }
 
     #[test]
@@ -2729,7 +2794,10 @@ mod test {
         assert!(!parsed.outputs.contains_key("pch"));
         // The consumed PCH is content-hashed.
         assert!(parsed.extra_hash_files.contains(&pch));
-        assert_eq!(parsed.common_args, ovec!["-Yustdafx.h", "-Fpstdafx.pch"]);
+        // /Yu and /Fp reach the compiler via unhashed_args, not common_args, so the
+        // PCH's (in real builds absolute) paths don't leak into the cache key.
+        assert!(parsed.common_args.is_empty());
+        assert_eq!(parsed.unhashed_args, ovec!["-Yustdafx.h", "-Fpstdafx.pch"]);
         assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
     }
 
@@ -3367,6 +3435,7 @@ mod test {
             extra_dist_files: vec![],
             extra_hash_files: vec![],
             msvc_show_includes: false,
+            pch_create_header: None,
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
@@ -3457,6 +3526,7 @@ mod test {
             extra_dist_files: vec![],
             extra_hash_files: vec![],
             msvc_show_includes: false,
+            pch_create_header: None,
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
