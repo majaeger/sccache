@@ -565,7 +565,7 @@ fn test_msvc_pch(compiler: Compiler, tempdir: &Path) {
     sccache_command()
         .args(use_args())
         .current_dir(tempdir)
-        .envs(env_vars)
+        .envs(env_vars.clone())
         .assert()
         .success();
     // The cached .pch and both objects are restored.
@@ -589,6 +589,32 @@ fn test_msvc_pch(compiler: Compiler, tempdir: &Path) {
         assert_eq!(2, info.stats.cache_hits.all());
         assert_eq!(2, info.stats.cache_misses.all());
         assert_eq!(&2, info.stats.cache_hits.get("C/C++").unwrap());
+    });
+
+    // Delete the .pch and the consumer object, then recompile *only* the /Yu
+    // consumer without first rebuilding the PCH. Because correctness comes from the
+    // preprocessed source (not the .pch binary), this still hits the cache - the
+    // clang-consistent behavior that avoids spurious misses from non-reproducible
+    // .pch files.
+    fs::remove_file(tempdir.join(use_obj)).unwrap();
+    fs::remove_file(tempdir.join(pch)).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(use_args())
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    assert!(
+        fs::metadata(tempdir.join(use_obj))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+    get_stats(|info| {
+        assert_eq!(1, info.stats.compile_requests);
+        assert_eq!(1, info.stats.cache_hits.all());
+        assert_eq!(0, info.stats.cache_misses.all());
+        assert_eq!(&1, info.stats.cache_hits.get("C/C++").unwrap());
     });
 }
 
