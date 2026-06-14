@@ -278,6 +278,7 @@ ArgData! {
     UsePch(PathBuf), // /Yu<header> - use a precompiled header.
     PchPath(PathBuf), // /Fp<path> - name of the precompiled header file.
     DisablePch, // /Y- - disable all precompiled header options.
+    PathMap(OsString), // /pathmap:OLD=NEW - remap paths embedded in the output.
 }
 
 use self::ArgData::*;
@@ -485,6 +486,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_flag!("openmp", PassThrough),
     msvc_flag!("openmp-", PassThrough),
     msvc_flag!("openmp:experimental", PassThrough),
+    msvc_take_arg!("pathmap:", OsString, Concatenated, PathMap), // /pathmap:OLD=NEW;...
     msvc_flag!("permissive", PassThrough),
     msvc_flag!("permissive-", PassThrough),
     msvc_take_arg!("reference", OsString, Separated, TooHard),
@@ -548,6 +550,7 @@ pub fn parse_arguments(
     let mut pch_path_arg: Option<PathBuf> = None;
     let mut pch_disabled = false;
     let mut pch_create_header: Option<OsString> = None;
+    let mut pathmap_present = false;
     let mut xclangs: Vec<OsString> = vec![];
     let mut clangs: Vec<OsString> = vec![];
     let mut profile_generate = false;
@@ -604,6 +607,7 @@ pub fn parse_arguments(
             | Some(Ignore)
             | Some(IgnoreWithSuffix(_))
             | Some(ExternalIncludePath(_)) => {}
+            Some(PathMap(_)) => pathmap_present = true,
             Some(SuppressCompilation) => {
                 return CompilerArguments::NotCompilation;
             }
@@ -654,6 +658,17 @@ pub fn parse_arguments(
             // elsewhere: the consumed .pch is content-hashed for /Yu, and the
             // created PCH's header contents + boundary are folded in for /Yc.
             Some(ProducePch(_)) | Some(UsePch(_)) | Some(PchPath(_)) => unhashed_args.extend(
+                arg.normalize(NormalizedDisposition::Concatenated)
+                    .iter_os_strings(),
+            ),
+            // /pathmap:OLD=NEW;... remaps paths embedded in the compiler's output.
+            // OLD is a per-checkout absolute prefix, so hashing it verbatim (as an
+            // unknown flag would, via common_args) defeats cross-directory sharing.
+            // Route it to unhashed_args so it reaches the compiler unhashed; the
+            // mapping is instead folded into the preprocessor output (see preprocess)
+            // where SCCACHE_BASEDIRS normalizes the OLD prefix like any other path,
+            // while the NEW target -- which does change the output -- is preserved.
+            Some(PathMap(_)) => unhashed_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -991,6 +1006,14 @@ pub fn parse_arguments(
         }
     }
 
+    // /pathmap mappings are folded into the preprocessor output by `preprocess`, so
+    // they must not be bypassed by preprocessor-cache (direct) mode, which returns a
+    // stored result key without re-running the fold and would otherwise let two
+    // different targets collide. Disable direct mode for these compiles, like PCH.
+    if pathmap_present {
+        too_hard_for_preprocessor_cache_mode.get_or_insert_with(|| "/pathmap".into());
+    }
+
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
         double_dash_input,
@@ -1152,7 +1175,16 @@ where
     let includes_prefix = includes_prefix.to_string();
     let cwd = cwd.to_owned();
 
-    let output = run_input_output(cmd, None).await?;
+    let mut output = run_input_output(cmd, None).await?;
+
+    // /pathmap:OLD=NEW;... remaps paths the compiler embeds in its output (debug
+    // info, __FILE__). OLD is a per-checkout absolute prefix, so the flag rides in
+    // unhashed_args (reaching the compiler) instead of being hashed verbatim, which
+    // would defeat cross-directory cache sharing. The mapping still changes the
+    // output, so fold it into the hashed preprocessor output and let SCCACHE_BASEDIRS
+    // normalize the OLD prefix like any other path. Done before the early return
+    // below so it also covers plain (non-PCH) compiles.
+    append_pathmap_markers(&mut output.stdout, &parsed_args.unhashed_args);
 
     let creating_pch = parsed_args.outputs.contains_key("pch");
     // clang-cl writes its dependency file from the -showIncludes notes (cl.exe uses
@@ -1280,6 +1312,34 @@ fn write_make_depfile(depfile: &Path, obj: &Path, input: &Path, includes: &[Stri
         }
     }
     Ok(())
+}
+
+/// Fold MSVC `/pathmap:OLD=NEW;...` mappings (collected in `unhashed_args`) into the
+/// preprocessor output so they take part in the cache key without being hashed
+/// verbatim. Each OLD is emitted with a trailing separator at a line boundary so the
+/// normal SCCACHE_BASEDIRS stripping removes the per-checkout prefix exactly as it
+/// does any other path, while the NEW target -- which changes the compiler's output
+/// -- is preserved. Two checkouts that map their roots to the same target then share
+/// a cache key; different targets, and OLDs outside the basedirs, stay distinct.
+fn append_pathmap_markers(stdout: &mut Vec<u8>, unhashed_args: &[OsString]) {
+    for arg in unhashed_args {
+        let s = arg.to_string_lossy();
+        if let Some(value) = s
+            .strip_prefix("/pathmap:")
+            .or_else(|| s.strip_prefix("-pathmap:"))
+        {
+            stdout.extend_from_slice(b"\n// sccache-msvc-pathmap");
+            for pair in value.split(';') {
+                let (old, new) = pair.split_once('=').unwrap_or((pair, ""));
+                let old = old.trim_end_matches(['\\', '/']);
+                stdout.push(b'\n');
+                stdout.extend_from_slice(old.as_bytes());
+                stdout.extend_from_slice(b"/=");
+                stdout.extend_from_slice(new.as_bytes());
+            }
+            stdout.push(b'\n');
+        }
+    }
 }
 
 /// Append a digest of the inputs that determine a PCH (`/Yc`) to the preprocessor
@@ -1420,10 +1480,13 @@ fn generate_compile_commands(
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
     #[cfg(feature = "dist-client")]
-    let dist_command = if uses_precompiled_header(parsed_args) {
+    let dist_command = if uses_precompiled_header(parsed_args) || uses_pathmap(parsed_args) {
         // Precompiled-header compiles are not safe to distribute yet: a /Yu remote
         // compile needs the .pch shipped as an input, and a /Yc remote compile from
-        // preprocessed source may not faithfully produce the .pch. Keep them local.
+        // preprocessed source may not faithfully produce the .pch. /pathmap compiles
+        // are likewise kept local: its OLD prefix is a local path that wouldn't match
+        // the remote sandbox, so a remote compile couldn't reproduce the remapping
+        // the cache key assumes. Keep them local.
         None
     } else {
         (|| {
@@ -1466,6 +1529,19 @@ fn uses_precompiled_header(parsed_args: &ParsedArguments) -> bool {
             let arg = arg.to_string_lossy();
             arg.starts_with("-Yu") || arg.starts_with("/Yu")
         })
+}
+
+/// Whether a parsed MSVC command uses `/pathmap`. These compiles embed remapped paths
+/// in their output and are cached locally but not distributed: the `OLD` prefix is a
+/// local path that wouldn't match the remote sandbox, so a remote compile couldn't
+/// faithfully reproduce the mapping the cache key assumes. `/pathmap` lives in
+/// `unhashed_args`, not `common_args`.
+#[cfg(feature = "dist-client")]
+fn uses_pathmap(parsed_args: &ParsedArguments) -> bool {
+    parsed_args.unhashed_args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.starts_with("/pathmap:") || arg.starts_with("-pathmap:")
+    })
 }
 
 /// Iterator that expands @response files in-place.
@@ -2728,6 +2804,55 @@ mod test {
         assert_eq!(parsed.unhashed_args.len(), 2);
         assert_eq!(parsed.unhashed_args[0].to_string_lossy(), yc);
         assert_eq!(parsed.unhashed_args[1].to_string_lossy(), fp);
+    }
+
+    #[test]
+    fn test_parse_arguments_pathmap_is_unhashed() {
+        // /pathmap carries a per-checkout absolute OLD prefix; it must reach the
+        // compiler via unhashed_args, never common_args (which is hashed verbatim),
+        // so that prefix can't defeat cross-directory cache sharing. The mapping is
+        // instead folded (basedir-normalized) into the preprocessor output.
+        let args = ovec!["-c", "/pathmap:C:\\repo=.", "-Fofoo.obj", "foo.cpp"];
+        let parsed = match parse_arguments(args) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(parsed.common_args.is_empty());
+        assert_eq!(parsed.unhashed_args.len(), 1);
+        assert_eq!(
+            parsed.unhashed_args[0].to_string_lossy(),
+            "/pathmap:C:\\repo=."
+        );
+        // Direct (preprocessor cache) mode is disabled so the folded /pathmap marker
+        // can't be bypassed (which would let two different targets collide).
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    #[test]
+    fn test_pathmap_folds_only_target_into_key() {
+        // The /pathmap fold plus SCCACHE_BASEDIRS stripping must make two checkouts
+        // that map their (different) roots to the same target hash identically, while
+        // keeping a different target distinct. Lowercase forward-slash paths keep the
+        // check platform-independent (strip_basedirs only case/slash-normalizes on
+        // Windows).
+        let strip = |pathmap: &str, base: &str| {
+            let mut buf = Vec::new();
+            append_pathmap_markers(&mut buf, &[OsString::from(pathmap)]);
+            crate::util::strip_basedirs(&buf, &[base.as_bytes().to_vec()]).into_owned()
+        };
+        let a = strip("/pathmap:/repo/clone_a=.", "/repo/clone_a/");
+        let b = strip("/pathmap:/repo/clone_b=.", "/repo/clone_b/");
+        assert_eq!(a, b, "same target must share once each root is stripped");
+        let c = strip("/pathmap:/repo/clone_a=/canon", "/repo/clone_a/");
+        assert_ne!(a, c, "a different target must stay distinct");
+
+        // Without basedirs the per-checkout prefix is retained, so the two checkouts
+        // do not share -- correct, since nothing has been location-normalized.
+        let mut raw_a = Vec::new();
+        append_pathmap_markers(&mut raw_a, &[OsString::from("/pathmap:/repo/clone_a=.")]);
+        let mut raw_b = Vec::new();
+        append_pathmap_markers(&mut raw_b, &[OsString::from("/pathmap:/repo/clone_b=.")]);
+        assert_ne!(raw_a, raw_b);
     }
 
     #[test]

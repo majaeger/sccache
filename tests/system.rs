@@ -1309,6 +1309,76 @@ fn test_msvc_pch_cross_directory(compiler: Compiler, tempdir: &Path) {
     });
 }
 
+// /pathmap:OLD=NEW remaps paths the compiler embeds in its output. sccache routes it
+// to unhashed_args and folds a basedir-normalized form of the mapping into the cache
+// key, so it neither breaks caching nor lets two different targets collide. (The
+// cross-directory sharing that the basedir normalization enables needs
+// SCCACHE_BASEDIRS, which the shared test server doesn't set; that is covered by the
+// unit test test_pathmap_folds_only_target_into_key.)
+fn test_msvc_pathmap(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pathmap: {}", name);
+
+    // A header makes pm.cpp report an include, so a preprocessor-cache entry would be
+    // stored if direct mode were active -- exercising (and guarding) the rule that
+    // /pathmap disables direct mode so a different target can't collide via it.
+    write_source(tempdir, "pm.h", "#pragma once\nint pm_helper();\n");
+    write_source(
+        tempdir,
+        "pm.cpp",
+        "#include \"pm.h\"\nint pm() { return pm_helper(); }\n",
+    );
+    let root = tempdir.to_string_lossy().into_owned();
+    let args = |target: &str| {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-Z7",
+            format!("/pathmap:{root}={target}"),
+            "-Fopm.obj",
+            "pm.cpp"
+        )
+    };
+
+    // First compile with /pathmap:<dir>=. is a cold miss.
+    zero_stats();
+    sccache_command()
+        .args(args("."))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    // An identical recompile hits: the folded mapping is deterministic.
+    zero_stats();
+    sccache_command()
+        .args(args("."))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+
+    // A different target changes the embedded paths, so it must not collide.
+    zero_stats();
+    sccache_command()
+        .args(args("/canon"))
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| {
+        assert_eq!(0, info.stats.cache_hits.all());
+        assert_eq!(1, info.stats.cache_misses.all());
+    });
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -1605,6 +1675,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_pch_user_show_includes(compiler.clone(), tempdir);
         test_msvc_pch_use_missing_not_cacheable(compiler.clone(), tempdir);
         test_msvc_pch_cross_directory(compiler.clone(), tempdir);
+        test_msvc_pathmap(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
