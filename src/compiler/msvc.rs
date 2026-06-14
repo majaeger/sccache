@@ -19,7 +19,7 @@ use crate::compiler::{
     SingleCompileCommand, clang, gcc, write_temp_file,
 };
 use crate::mock_command::{CommandCreatorSync, RunCommand};
-use crate::util::{OsStrExt, encode_path, run_input_output};
+use crate::util::{Digest, OsStrExt, encode_path, run_input_output};
 use crate::{counted_array, dist};
 use async_trait::async_trait;
 use fs::File;
@@ -1066,7 +1066,9 @@ pub fn preprocess_cmd<T>(
         .current_dir(cwd);
 
     if is_clang {
-        if parsed_args.depfile.is_some() && !parsed_args.msvc_show_includes {
+        if (parsed_args.depfile.is_some() || parsed_args.outputs.contains_key("pch"))
+            && !parsed_args.msvc_show_includes
+        {
             cmd.arg("-showIncludes");
         }
     } else {
@@ -1074,6 +1076,14 @@ pub fn preprocess_cmd<T>(
         if let Some(ref depfile) = parsed_args.depfile {
             cmd.arg("/sourceDependencies");
             cmd.arg(depfile);
+        }
+        // When creating a PCH (/Yc), key the cache on the full set of headers baked
+        // into the PCH. `cl /EP` omits `#define` directives, so the preprocessed text
+        // can't capture macros that the PCH bakes in for later `/Yu` consumers. Ask
+        // the compiler to report the included files so `preprocess()` can fold their
+        // contents into the cache key.
+        if parsed_args.outputs.contains_key("pch") && !parsed_args.msvc_show_includes {
+            cmd.arg("/showIncludes");
         }
         // Windows SDK generates C4668 during preprocessing, but compiles fine.
         // Read for more info: https://github.com/mozilla/sccache/issues/1725
@@ -1126,6 +1136,21 @@ where
     let cwd = cwd.to_owned();
 
     let output = run_input_output(cmd, None).await?;
+
+    // When creating a PCH (/Yc), fold the inputs that determine the PCH into the
+    // preprocessor output so they are reflected in the cache key. `cl /EP` does not
+    // emit `#define` directives, so the preprocessed text alone cannot capture
+    // macros (from the source before the PCH boundary, the PCH header, its
+    // transitive includes, or `/D`) that the PCH bakes in for later `/Yu` consumers.
+    // Applies to both cl.exe and clang-cl.
+    if parsed_args.outputs.contains_key("pch") {
+        return Ok(fold_pch_creation_state(
+            output,
+            &parsed_args,
+            &cwd,
+            &includes_prefix,
+        ));
+    }
 
     if !is_clang {
         return Ok(output);
@@ -1186,6 +1211,95 @@ where
         })
     } else {
         Ok(output)
+    }
+}
+
+/// Fold the inputs that determine a PCH (`/Yc`) into the preprocessor output so
+/// they are reflected in the cache key.
+///
+/// `cl /EP` does not emit `#define` directives, so the preprocessed text alone
+/// does not capture macros that the PCH bakes in for later `/Yu` consumers (a
+/// `#define` change in a header would otherwise produce identical preprocessed
+/// output and a stale-PCH cache hit). We hash, in a deterministic order:
+///   * the `/Yc` source file's raw contents (captures pre-boundary macros in it),
+///   * the preprocessor-state args (`/D`, `/U`, `/I`, `/FI`, ...),
+///   * the contents of every header the compiler reported via `/showIncludes`
+///     (captures transitive `#define` changes),
+/// and append the resulting digest to the preprocessor output.
+fn fold_pch_creation_state(
+    output: process::Output,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    includes_prefix: &str,
+) -> process::Output {
+    // Best effort: if we can't decode the include listing, return the output
+    // unchanged (the compile will still run; we just may miss a header change).
+    let stderr = match from_local_codepage(&output.stderr) {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("Failed to decode /showIncludes output: {}", e);
+            return output;
+        }
+    };
+
+    // Collect the reported include files (in order, de-duplicated) and rebuild the
+    // stderr without the include notes (unless the user asked to see them).
+    let mut seen = HashSet::new();
+    let mut includes = Vec::new();
+    let mut filtered_stderr = Vec::new();
+    for line in stderr.lines() {
+        if line.starts_with(includes_prefix) {
+            let path = line[includes_prefix.len()..].trim().to_string();
+            if seen.insert(path.clone()) {
+                includes.push(path);
+            }
+            if !parsed_args.msvc_show_includes {
+                continue;
+            }
+        }
+        filtered_stderr.extend_from_slice(line.as_bytes());
+        filtered_stderr.push(b'\n');
+    }
+
+    let read_file = |path: &Path| -> Vec<u8> {
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        };
+        fs::read(&abs).unwrap_or_else(|e| {
+            debug!("PCH input {} unreadable: {}", abs.display(), e);
+            b"\0sccache-unreadable\0".to_vec()
+        })
+    };
+
+    let mut digest = Digest::new();
+    digest.update(b"sccache-msvc-pch-state-v1");
+    // The /Yc source itself, whose pre-boundary macros are baked into the PCH.
+    digest.update(b"\0src\0");
+    digest.update(&read_file(&parsed_args.input));
+    // Preprocessor-state args influence the PCH but are not otherwise part of the
+    // object key (they live in preprocessor_args, which the key excludes).
+    for arg in &parsed_args.preprocessor_args {
+        digest.update(b"\0arg\0");
+        digest.update(arg.to_string_lossy().as_bytes());
+    }
+    // Every header baked into the PCH, by content, in include order.
+    for path in &includes {
+        digest.update(b"\0inc\0");
+        digest.update(path.as_bytes());
+        digest.update(&read_file(Path::new(path)));
+    }
+
+    let mut stdout = output.stdout;
+    stdout.extend_from_slice(b"\n// sccache-pch-state:");
+    stdout.extend_from_slice(digest.finish().as_bytes());
+    stdout.push(b'\n');
+
+    process::Output {
+        status: output.status,
+        stdout,
+        stderr: filtered_stderr,
     }
 }
 

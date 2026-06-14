@@ -702,6 +702,248 @@ fn test_msvc_pch_hidden_macro_state(compiler: Compiler, tempdir: &Path) {
     );
 }
 
+// Regression test: a `#define` change in a header transitively included by the
+// PCH header must invalidate the `/Yc` create. `cl /EP` does not emit `#define`s,
+// so the create's preprocessed output is unchanged - without folding the header
+// contents into the key, the create would serve a STALE `.pch` and the consumer
+// would compile against the wrong macro value.
+fn test_msvc_pch_transitive_macro_invalidation(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_transitive_macro_invalidation: {}", name);
+
+    // The macro lives in config_t.h, which is included by the PCH header.
+    write_source(tempdir, "config_t.h", "#pragma once\n#define T_VALUE 1\n");
+    write_source(
+        tempdir,
+        "pch_t.h",
+        "#pragma once\n#include \"config_t.h\"\nint t_helper(int);\n",
+    );
+    write_source(tempdir, "make_t.cpp", "#include \"pch_t.h\"\n");
+    write_source(
+        tempdir,
+        "use_t.cpp",
+        "#include \"pch_t.h\"\nint t_use() { return T_VALUE; }\n",
+    );
+
+    let create = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Ycpch_t.h",
+            "-Fpt.pch",
+            "-Fomake_t.obj",
+            "make_t.cpp"
+        )
+    };
+    let use_it = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Yupch_t.h",
+            "-Fpt.pch",
+            "-Fouse_t.obj",
+            "use_t.cpp"
+        )
+    };
+
+    // Build the PCH then a consumer (both cold misses).
+    zero_stats();
+    for args in [create(), use_it()] {
+        sccache_command()
+            .args(args)
+            .current_dir(tempdir)
+            .envs(env_vars.clone())
+            .assert()
+            .success();
+    }
+    get_stats(|info| {
+        assert_eq!(0, info.stats.cache_hits.all());
+        assert_eq!(2, info.stats.cache_misses.all());
+    });
+    let use_v1 = fs::read(tempdir.join("use_t.obj")).unwrap();
+
+    // Change only the transitively-included macro, then rebuild. The /Yc create
+    // must MISS (not serve a stale PCH), so neither compile may hit the cache, and
+    // the consumer object must change.
+    write_source(tempdir, "config_t.h", "#pragma once\n#define T_VALUE 2\n");
+    zero_stats();
+    for args in [create(), use_it()] {
+        sccache_command()
+            .args(args)
+            .current_dir(tempdir)
+            .envs(env_vars.clone())
+            .assert()
+            .success();
+    }
+    get_stats(|info| {
+        assert_eq!(
+            0,
+            info.stats.cache_hits.all(),
+            "/Yc served a stale PCH after a transitive header change"
+        );
+        assert_eq!(2, info.stats.cache_misses.all());
+    });
+    let use_v2 = fs::read(tempdir.join("use_t.obj")).unwrap();
+    assert_ne!(
+        use_v1, use_v2,
+        "consumer object did not change after a transitive macro change"
+    );
+}
+
+// Regression test: a command-line `/D` macro is baked into the PCH but not emitted
+// by `cl /EP`, so changing it must invalidate the `/Yc` create.
+fn test_msvc_pch_define_invalidation(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_define_invalidation: {}", name);
+
+    write_source(tempdir, "pch_d.h", "#pragma once\nint d_helper(int);\n");
+    write_source(tempdir, "make_d.cpp", "#include \"pch_d.h\"\n");
+
+    let create = |def: &str| {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            def,
+            "-Ycpch_d.h",
+            "-Fpd.pch",
+            "-Fomake_d.obj",
+            "make_d.cpp"
+        )
+    };
+    let run = |args: Vec<OsString>| {
+        sccache_command()
+            .args(args)
+            .current_dir(tempdir)
+            .envs(env_vars.clone())
+            .assert()
+            .success();
+    };
+
+    zero_stats();
+    run(create("/DD_VALUE=1"));
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    // A different /D value must produce a different PCH state => a miss.
+    zero_stats();
+    run(create("/DD_VALUE=2"));
+    get_stats(|info| {
+        assert_eq!(
+            0,
+            info.stats.cache_hits.all(),
+            "/Yc reused a PCH built with a different /D value"
+        );
+        assert_eq!(1, info.stats.cache_misses.all());
+    });
+
+    // Repeating the same /D value hits.
+    zero_stats();
+    run(create("/DD_VALUE=2"));
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+}
+
+// Verify a PCH restored from the cache is a valid binary the compiler can consume:
+// build a PCH, delete it, rebuild it from cache (a hit), then compile a fresh
+// consumer with `/Yu` against the restored `.pch` (a miss that runs real cl.exe).
+fn test_msvc_pch_restored_pch_consumable(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_restored_pch_consumable: {}", name);
+
+    write_source(tempdir, "pch_r.h", "#pragma once\nint r_helper(int);\n");
+    write_source(tempdir, "make_r.cpp", "#include \"pch_r.h\"\n");
+    write_source(
+        tempdir,
+        "use_r.cpp",
+        "#include \"pch_r.h\"\nint r_use() { return 3; }\n",
+    );
+
+    let create = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Ycpch_r.h",
+            "-Fpr.pch",
+            "-Fomake_r.obj",
+            "make_r.cpp"
+        )
+    };
+
+    // Build the PCH (miss).
+    zero_stats();
+    sccache_command()
+        .args(create())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    // Delete it and rebuild from cache (a hit restores the .pch to disk).
+    fs::remove_file(tempdir.join("r.pch")).unwrap();
+    fs::remove_file(tempdir.join("make_r.obj")).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(create())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| {
+        assert_eq!(
+            1,
+            info.stats.cache_hits.all(),
+            "/Yc did not restore the .pch from cache"
+        );
+    });
+    assert!(
+        fs::metadata(tempdir.join("r.pch"))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+
+    // Compile a fresh consumer against the restored .pch; this runs real cl.exe and
+    // fails if the restored .pch is corrupt.
+    sccache_command()
+        .args(vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Yupch_r.h",
+            "-Fpr.pch",
+            "-Fouse_r.obj",
+            "use_r.cpp"
+        ))
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    assert!(
+        fs::metadata(tempdir.join("use_r.obj"))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -990,6 +1232,9 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_responsefile(compiler.clone(), tempdir);
         test_msvc_pch(compiler.clone(), tempdir);
         test_msvc_pch_hidden_macro_state(compiler.clone(), tempdir);
+        test_msvc_pch_transitive_macro_invalidation(compiler.clone(), tempdir);
+        test_msvc_pch_define_invalidation(compiler.clone(), tempdir);
+        test_msvc_pch_restored_pch_consumable(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
