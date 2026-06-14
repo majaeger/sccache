@@ -523,6 +523,27 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("@", PathBuf, Concatenated, TooHardPath),
 ]);
 
+/// Precompiled-header flags parsed from an MSVC command line.
+///
+/// `/Yc` and `/Yu` share a boundary `header`; `create`/`use_pch` record which was
+/// requested (both at once is an error). `/Fp` overrides the `.pch` path, and `/Y-`
+/// (`disabled`) cancels PCH entirely.
+#[derive(Default)]
+struct PchArgs {
+    header: Option<PathBuf>,
+    create: bool,
+    use_pch: bool,
+    fp_path: Option<PathBuf>,
+    disabled: bool,
+}
+
+impl PchArgs {
+    /// A `/Yc` or `/Yu` is in effect and not cancelled by `/Y-`.
+    fn is_active(&self) -> bool {
+        !self.disabled && (self.create || self.use_pch)
+    }
+}
+
 pub fn parse_arguments(
     arguments: &[OsString],
     cwd: &Path,
@@ -542,13 +563,7 @@ pub fn parse_arguments(
     let mut pdb = None;
     let mut depfile = None;
     let mut show_includes = false;
-    // Precompiled header state: the header given to /Yc or /Yu, whether we are
-    // creating (/Yc) or using (/Yu) a PCH, the /Fp path, and whether /Y- was seen.
-    let mut pch_header: Option<PathBuf> = None;
-    let mut pch_create = false;
-    let mut pch_use = false;
-    let mut pch_path_arg: Option<PathBuf> = None;
-    let mut pch_disabled = false;
+    let mut pch = PchArgs::default();
     let mut pch_create_header: Option<OsString> = None;
     let mut pathmap_present = false;
     let mut xclangs: Vec<OsString> = vec![];
@@ -592,15 +607,15 @@ pub fn parse_arguments(
             Some(ProgramDatabase(p)) => pdb = Some(p.clone()),
             Some(DebugInfo) => debug_info = true,
             Some(ProducePch(header)) => {
-                pch_create = true;
-                pch_header = Some(header.clone());
+                pch.create = true;
+                pch.header = Some(header.clone());
             }
             Some(UsePch(header)) => {
-                pch_use = true;
-                pch_header = Some(header.clone());
+                pch.use_pch = true;
+                pch.header = Some(header.clone());
             }
-            Some(PchPath(path)) => pch_path_arg = Some(path.clone()),
-            Some(DisablePch) => pch_disabled = true,
+            Some(PchPath(path)) => pch.fp_path = Some(path.clone()),
+            Some(DisablePch) => pch.disabled = true,
             Some(PreprocessorArgument(_))
             | Some(PreprocessorArgumentPath(_))
             | Some(ExtraHashFile(_))
@@ -648,15 +663,12 @@ pub fn parse_arguments(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
-            // /Yc, /Yu and /Fp carry paths that are absolute in real builds (CMake
-            // emits them under the build tree). Route them through unhashed_args so
-            // those paths stay out of the cache key -- otherwise a repo cloned to a
-            // different directory (SCCACHE_BASEDIRS) would never share PCH hits,
-            // since common_args is hashed verbatim while only preprocessor *output*
-            // is basedir-normalized. They still reach the real compile via
-            // unhashed_args. Their semantic effect is preserved in the key
-            // elsewhere: the consumed .pch is content-hashed for /Yu, and the
-            // created PCH's header contents + boundary are folded in for /Yc.
+            // /Yc, /Yu and /Fp carry build-tree-absolute paths. common_args is hashed
+            // verbatim (only preprocessor *output* is basedir-normalized), so hashing
+            // them would block cross-directory sharing (SCCACHE_BASEDIRS) for a repo
+            // cloned elsewhere. Route them to unhashed_args: they still reach the
+            // compile, and their semantic effect is folded into the key separately
+            // (the .pch content-hash for /Yu, the header contents + boundary for /Yc).
             Some(ProducePch(_)) | Some(UsePch(_)) | Some(PchPath(_)) => unhashed_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
@@ -925,23 +937,22 @@ pub fn parse_arguments(
         };
     }
 
-    // Resolve precompiled header (PCH) handling. /Y- disables all PCH options, so
-    // when present we treat /Yc and /Yu as no-ops (they are still passed through to
-    // the compiler, which ignores them).
+    // Resolve precompiled-header handling. (/Y- disables /Yc and /Yu; they're still
+    // passed to the compiler, which ignores them.)
     let mut too_hard_for_preprocessor_cache_mode = None;
-    if !pch_disabled && (pch_create || pch_use) {
-        if pch_create && pch_use {
+    if pch.is_active() {
+        if pch.create && pch.use_pch {
             cannot_cache!("both /Yc and /Yu");
         }
-        // The header-less /Yc and /Yu forms rely on `#pragma hdrstop` to mark the
-        // PCH boundary, which we don't model; bail out for safety.
-        let header = pch_header.as_ref().expect("PCH mode implies a header arg");
+        // The header-less /Yc and /Yu forms mark the boundary with `#pragma hdrstop`,
+        // which we don't model; bail out for safety.
+        let header = pch.header.as_ref().expect("PCH mode implies a header arg");
         if header.as_os_str().is_empty() {
             cannot_cache!("precompiled header without a header name");
         }
         // Determine where the .pch lives. With /Fp it's the given path (defaulting
         // the extension to .pch); without /Fp, MSVC names it <header-stem>.pch.
-        let pch_path = match &pch_path_arg {
+        let pch_path = match &pch.fp_path {
             Some(p) => {
                 if p.as_os_str().to_string_lossy().ends_with(['\\', '/']) {
                     // A directory makes MSVC pick a toolset-version default name
@@ -957,7 +968,7 @@ pub fn parse_arguments(
             None => PathBuf::from(header.file_name().unwrap_or(header.as_os_str()))
                 .with_extension("pch"),
         };
-        if pch_create {
+        if pch.create {
             // Creating a PCH also produces an object file (already an output). Cache
             // the .pch next to it so a cache hit restores a usable header. Resolve
             // against `cwd` before comparing so an absolute /Fp can't alias a
@@ -980,19 +991,13 @@ pub fn parse_arguments(
             pch_create_header = Some(header.as_os_str().to_os_string());
             too_hard_for_preprocessor_cache_mode = Some("-Yc".into());
         } else {
-            // Using a PCH: the compiler consumes the binary .pch, not the current
-            // header text. Crucially, an MSVC .pch can bake in preprocessor state
-            // (macros, code) that appears *before* the PCH header in the source that
-            // created it (the /Yc translation unit). That state is invisible to the
-            // consumer's `cl /EP /Yu` output (which ignores the PCH and only expands
-            // the `#include`), so the preprocessed source does NOT fully determine
-            // the object. We must therefore fold the .pch *content* into the cache
-            // key. (This is why MSVC PCH can't be treated like clang's -include-pch,
-            // which relies on preprocessed source, and why these compiles are not
-            // distributed: the remote only receives the preprocessed source.)
-            //
-            // A missing PCH would fail the real compile, so refuse to cache rather
-            // than risk a misleading hit from the preprocessed source alone.
+            // A /Yu compile consumes the binary .pch, which can bake in preprocessor
+            // state (macros, code) from before the boundary in its /Yc translation
+            // unit. That state is invisible to this TU's `cl /EP /Yu` output, so the
+            // preprocessed source doesn't fully determine the object -- we must fold
+            // the .pch *content* into the key. (Hence MSVC PCH is unlike clang's
+            // -include-pch, and why these compiles aren't distributed.) A missing
+            // .pch would fail the real compile, so refuse to cache instead.
             let abs_pch = if pch_path.is_absolute() {
                 pch_path
             } else {
@@ -1397,15 +1402,11 @@ fn append_pch_creation_state(
         digest.update(b"\0inc\0");
         digest.update(&read_file(Path::new(path)));
     }
-    // The PCH boundary header's identity. `cl /EP` ignores `/Yc`, so the
-    // preprocessed text and the included-header set are identical no matter which
-    // `#include` is the boundary; without this, the same source precompiled at
-    // different boundaries (`/Yc a.h` vs `/Yc b.h`) would collide. We fold a
-    // location-independent form -- the path relative to `cwd` when the header lives
-    // under it (true for CMake, whose boundary sits in the build tree), else the
-    // basename -- so this never re-introduces an absolute path into the key.
-    // (Same-basename headers in different directories are still disambiguated by
-    // their contents, hashed just above.)
+    // The boundary header's identity. `cl /EP` ignores `/Yc`, so two compiles of the
+    // same source at different boundaries (`/Yc a.h` vs `/Yc b.h`) produce identical
+    // preprocessed text and would collide without this. Fold a location-independent
+    // form (path relative to `cwd`, else basename) so the key stays checkout-relative;
+    // same-basename headers elsewhere are still disambiguated by the contents above.
     if let Some(header) = &parsed_args.pch_create_header {
         let abs = cwd.join(header);
         let token = match abs.strip_prefix(cwd) {
