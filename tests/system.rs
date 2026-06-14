@@ -944,6 +944,255 @@ fn test_msvc_pch_restored_pch_consumable(compiler: Compiler, tempdir: &Path) {
     );
 }
 
+// `/Yc` with a default PCH name (no `/Fp`): MSVC names the PCH after the *header*
+// (not the source). Use distinct header/source stems so the test fails if sccache
+// tracked the wrong default-name output.
+fn test_msvc_pch_default_name(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_default_name: {}", name);
+
+    write_source(
+        tempdir,
+        "pch_header.h",
+        "#pragma once\nint dn_helper(int);\n",
+    );
+    write_source(tempdir, "make_src.cpp", "#include \"pch_header.h\"\n");
+
+    // No /Fp, and the header stem (pch_header) differs from the source stem
+    // (make_src); MSVC writes pch_header.pch.
+    let args = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Ycpch_header.h",
+            "-Fomake_src.obj",
+            "make_src.cpp"
+        )
+    };
+
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    assert!(
+        fs::metadata(tempdir.join("pch_header.pch"))
+            .map(|m| m.len() > 0)
+            .unwrap(),
+        "default PCH should be named after the header (pch_header.pch)"
+    );
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    // Remove the outputs and rebuild: a cache hit must restore the default-named
+    // .pch, proving sccache tracked it as an output.
+    fs::remove_file(tempdir.join("pch_header.pch")).unwrap();
+    fs::remove_file(tempdir.join("make_src.obj")).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+    assert!(
+        fs::metadata(tempdir.join("pch_header.pch"))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+}
+
+// `/Y-` disables PCH options: a `/Yc ... /Y-` compile produces no `.pch` and is
+// cached as an ordinary compile.
+fn test_msvc_pch_disabled_by_y_minus(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_disabled_by_y_minus: {}", name);
+
+    write_source(tempdir, "ym.h", "#pragma once\nint ym_helper(int);\n");
+    write_source(
+        tempdir,
+        "ym.cpp",
+        "#include \"ym.h\"\nint ym() { return 0; }\n",
+    );
+
+    let args = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Ycym.h",
+            "-Fpym.pch",
+            "-Y-",
+            "-Foym.obj",
+            "ym.cpp"
+        )
+    };
+
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    // /Y- means no PCH is produced.
+    assert!(
+        fs::metadata(tempdir.join("ym.pch")).is_err(),
+        "/Y- should disable PCH creation"
+    );
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    // It caches like a normal compile.
+    fs::remove_file(tempdir.join("ym.obj")).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+}
+
+// A user-supplied `/showIncludes` together with `/Yc`: sccache parses the include
+// notes to hash the PCH inputs, but must still surface them on the user's stderr
+// and must still cache and invalidate correctly.
+fn test_msvc_pch_user_show_includes(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_user_show_includes: {}", name);
+
+    write_source(tempdir, "si_config.h", "#pragma once\n#define SI_VALUE 1\n");
+    write_source(
+        tempdir,
+        "si.h",
+        "#pragma once\n#include \"si_config.h\"\nint si_helper(int);\n",
+    );
+    write_source(tempdir, "si.cpp", "#include \"si.h\"\n");
+
+    let args = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Ycsi.h",
+            "-Fpsi.pch",
+            "-showIncludes",
+            "-Fosi.obj",
+            "si.cpp"
+        )
+    };
+
+    // The user's /showIncludes notes must still be visible (cl.exe emits them on
+    // stdout); the PCH-state fold reads them from the /EP preprocessor run's stderr
+    // and must not swallow the user-facing ones.
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("si.h").from_utf8());
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    // Unchanged rebuild hits.
+    fs::remove_file(tempdir.join("si.pch")).unwrap();
+    fs::remove_file(tempdir.join("si.obj")).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+
+    // A transitive macro change still invalidates even with user /showIncludes on.
+    write_source(tempdir, "si_config.h", "#pragma once\n#define SI_VALUE 2\n");
+    fs::remove_file(tempdir.join("si.pch")).unwrap();
+    fs::remove_file(tempdir.join("si.obj")).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| {
+        assert_eq!(
+            0,
+            info.stats.cache_hits.all(),
+            "/Yc with user /showIncludes served a stale PCH after a macro change"
+        );
+        assert_eq!(1, info.stats.cache_misses.all());
+    });
+}
+
+// A `/Yu` whose `.pch` does not exist must not be cached (the real compile fails,
+// exactly as cl.exe would, and sccache records it as non-cacheable).
+fn test_msvc_pch_use_missing_not_cacheable(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_use_missing_not_cacheable: {}", name);
+
+    write_source(tempdir, "miss.h", "#pragma once\nint miss_helper(int);\n");
+    write_source(
+        tempdir,
+        "miss_use.cpp",
+        "#include \"miss.h\"\nint miss_use() { return miss_helper(1); }\n",
+    );
+
+    zero_stats();
+    // No PCH was created, so missing.pch does not exist.
+    sccache_command()
+        .args(vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Yumiss.h",
+            "-Fpmissing.pch",
+            "-Fomiss_use.obj",
+            "miss_use.cpp"
+        ))
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .failure();
+    get_stats(|info| {
+        assert_eq!(0, info.stats.cache_hits.all());
+        assert_eq!(0, info.stats.cache_misses.all());
+        assert_eq!(1, info.stats.requests_not_cacheable);
+        assert_eq!(
+            Some(&1),
+            info.stats
+                .not_cached
+                .get("precompiled header file not found")
+        );
+    });
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -1235,6 +1484,10 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_pch_transitive_macro_invalidation(compiler.clone(), tempdir);
         test_msvc_pch_define_invalidation(compiler.clone(), tempdir);
         test_msvc_pch_restored_pch_consumable(compiler.clone(), tempdir);
+        test_msvc_pch_default_name(compiler.clone(), tempdir);
+        test_msvc_pch_disabled_by_y_minus(compiler.clone(), tempdir);
+        test_msvc_pch_user_show_includes(compiler.clone(), tempdir);
+        test_msvc_pch_use_missing_not_cacheable(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
