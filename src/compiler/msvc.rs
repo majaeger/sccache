@@ -282,6 +282,7 @@ ArgData! {
     DisablePch, // /Y- - disable all precompiled header options.
     PathMap(OsString), // /pathmap:OLD=NEW - remap paths embedded in the output.
     DynamicDeopt, // /dynamicdeopt - emits a companion <obj>.alt.obj to cache.
+    TrimFile(PathBuf), // /d1trimfile:<prefix> - strip <prefix> from embedded paths.
 }
 
 use self::ArgData::*;
@@ -447,6 +448,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("clr:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("constexpr:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("d1nodatetime", PassThrough),
+    msvc_take_arg!("d1trimfile:", PathBuf, Concatenated, TrimFile), // /d1trimfile:<prefix>
     msvc_take_arg!("deps", PathBuf, Concatenated, DepFile),
     msvc_take_arg!("diagnostics:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("doc", PathBuf, Concatenated, TooHardPath), // Creates an .xdc file.
@@ -570,6 +572,7 @@ pub fn parse_arguments(
     let mut pch = PchArgs::default();
     let mut pathmap_present = false;
     let mut dynamic_deopt = false;
+    let mut trimfile_present = false;
     let mut xclangs: Vec<OsString> = vec![];
     let mut clangs: Vec<OsString> = vec![];
     let mut profile_generate = false;
@@ -621,6 +624,7 @@ pub fn parse_arguments(
             Some(PchPath(path)) => pch.fp_path = Some(path.clone()),
             Some(DisablePch) => pch.disabled = true,
             Some(DynamicDeopt) => dynamic_deopt = true,
+            Some(TrimFile(_)) => trimfile_present = true,
             Some(PreprocessorArgument(_))
             | Some(PreprocessorArgumentPath(_))
             | Some(ExtraHashFile(_))
@@ -696,6 +700,14 @@ pub fn parse_arguments(
             // where SCCACHE_BASEDIRS normalizes the OLD prefix like any other path,
             // while the NEW target -- which does change the output -- is preserved.
             Some(PathMap(_)) => unhashed_args.extend(
+                arg.normalize(NormalizedDisposition::Concatenated)
+                    .iter_os_strings(),
+            ),
+            // /d1trimfile:<prefix> strips a per-checkout prefix from paths the compiler
+            // embeds in its output. Like /pathmap, route it to unhashed_args and fold a
+            // basedir-normalized form into the key (see preprocess) so two checkouts
+            // trimming their own root share, while a different prefix stays distinct.
+            Some(TrimFile(_)) => unhashed_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -1058,6 +1070,11 @@ pub fn parse_arguments(
     if pathmap_present {
         too_hard_for_preprocessor_cache_mode.get_or_insert_with(|| "/pathmap".into());
     }
+    // /d1trimfile is folded basedir-normalized into the key in preprocess() too, so
+    // disable direct mode for the same reason (it would otherwise bypass the fold).
+    if trimfile_present {
+        too_hard_for_preprocessor_cache_mode.get_or_insert_with(|| "/d1trimfile".into());
+    }
 
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
@@ -1230,6 +1247,20 @@ where
     // normalize the OLD prefix like any other path. Done before the early return
     // below so it also covers plain (non-PCH) compiles.
     append_pathmap_markers(&mut output.stdout, &parsed_args.unhashed_args);
+
+    // /d1trimfile:<prefix> strips a per-checkout prefix from paths the compiler embeds
+    // in its output. It rides in unhashed_args; fold a basedir-normalized form of the
+    // prefix into the key so two checkouts trimming their own root share while a
+    // different prefix stays distinct.
+    for arg in &parsed_args.unhashed_args {
+        let s = arg.to_string_lossy();
+        if let Some(prefix) = s
+            .strip_prefix("/d1trimfile:")
+            .or_else(|| s.strip_prefix("-d1trimfile:"))
+        {
+            append_basedir_path_marker(&mut output.stdout, b"d1trimfile", prefix);
+        }
+    }
 
     // Fold a schema marker into the hashed preprocessor output so a /dynamicdeopt
     // compile's cache key differs from one computed without companion-awareness --
@@ -2678,6 +2709,36 @@ mod test {
         );
         let c = fold("/repo/clone_a/build/other.pdb", "/repo/clone_a/");
         assert_ne!(a, c, "a different PDB target must stay distinct");
+    }
+
+    #[test]
+    fn test_parse_arguments_d1trimfile_is_unhashed() {
+        // /d1trimfile:<prefix> used to be unrecognized: a slash-prefixed unknown flag
+        // is treated as a raw input ("multiple input files" => non-cacheable). Now it
+        // is recognized and routed to unhashed_args (its per-checkout prefix is folded
+        // basedir-normalized into the key, not hashed verbatim), and it disables direct
+        // mode. The compile stays cacheable.
+        let cwd = std::env::current_dir().unwrap();
+        let trim = format!("/d1trimfile:{}", cwd.display());
+        let args = ovec!["-c", "f.c", "-Zi", "-Fdf.pdb", &trim, "-Fof.obj"];
+        let parsed = match super::parse_arguments(&args, &cwd, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(
+            !parsed
+                .common_args
+                .iter()
+                .any(|a| a.to_string_lossy().contains("d1trimfile")),
+            "the /d1trimfile prefix must not be hashed in common_args"
+        );
+        assert!(
+            parsed
+                .unhashed_args
+                .iter()
+                .any(|a| a.to_string_lossy() == trim)
+        );
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
     }
 
     #[test]

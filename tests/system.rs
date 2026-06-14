@@ -1541,6 +1541,58 @@ fn test_msvc_zi_pdb(compiler: Compiler, tempdir: &Path) {
     });
 }
 
+// /d1trimfile:<prefix> homogenizes the paths the compiler embeds (for reproducible,
+// relocatable debug info). sccache previously mis-parsed its slash+drive-colon path
+// as a second input ("multiple input files" => non-cacheable); now it is recognized
+// and cacheable, and its per-checkout prefix is folded basedir-normalized into the
+// key (the cross-checkout normalization is covered by the unit tests).
+fn test_msvc_d1trimfile(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_d1trimfile: {}", name);
+
+    write_source(tempdir, "tf.cpp", "int tf() { return 13; }\n");
+    let trim = format!("/d1trimfile:{}", tempdir.display());
+    let args = || {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-Zi",
+            "-Fdtf.pdb",
+            &trim,
+            "-Fotf.obj",
+            "tf.cpp"
+        )
+    };
+
+    // Recognized and cacheable: a cold miss (NOT a non-cacheable "multiple input
+    // files", which would leave cache_misses at 0).
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+
+    // Identical recompile hits and restores the outputs.
+    fs::remove_file(tempdir.join("tf.obj")).unwrap();
+    fs::remove_file(tempdir.join("tf.pdb")).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(args())
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -1840,6 +1892,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_pathmap(compiler.clone(), tempdir);
         test_msvc_dynamicdeopt_companion_obj(compiler.clone(), tempdir);
         test_msvc_zi_pdb(compiler.clone(), tempdir);
+        test_msvc_d1trimfile(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
