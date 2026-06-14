@@ -1606,13 +1606,21 @@ fn generate_compile_commands(
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
     #[cfg(feature = "dist-client")]
-    let dist_command = if uses_precompiled_header(parsed_args) || uses_pathmap(parsed_args) {
+    let dist_command = if uses_precompiled_header(parsed_args)
+        || uses_pathmap(parsed_args)
+        || uses_program_database(parsed_args)
+        || uses_trimfile(parsed_args)
+    {
         // Precompiled-header compiles are not safe to distribute yet: a /Yu remote
         // compile needs the .pch shipped as an input, and a /Yc remote compile from
         // preprocessed source may not faithfully produce the .pch. /pathmap compiles
         // are likewise kept local: its OLD prefix is a local path that wouldn't match
         // the remote sandbox, so a remote compile couldn't reproduce the remapping
-        // the cache key assumes. Keep them local.
+        // the cache key assumes. A /Zi compile's /Fd PDB path and any /d1trimfile
+        // prefix are the same kind of local path, and both ride in unhashed_args --
+        // which the dist command below does NOT forward -- so a remote compile would
+        // silently drop them (writing the default shared PDB / skipping the path
+        // trimming the cache key assumes). Keep all of these local.
         None
     } else {
         (|| {
@@ -1667,6 +1675,33 @@ fn uses_pathmap(parsed_args: &ParsedArguments) -> bool {
     parsed_args.unhashed_args.iter().any(|arg| {
         let arg = arg.to_string_lossy();
         arg.starts_with("/pathmap:") || arg.starts_with("-pathmap:")
+    })
+}
+
+/// Whether a parsed MSVC command carries a `/Fd` (program database / PDB path). When
+/// present it rides in `unhashed_args` (its per-checkout path would otherwise defeat
+/// cross-directory sharing), and the dist command below does NOT forward unhashed_args,
+/// so a remote compile would drop `/Fd` and write the default shared PDB instead of the
+/// `/Fd` target the cache key assumes. These `/Zi`+`/Fd` compiles are cached locally but
+/// not distributed. (A `/Zi` compile WITHOUT `/Fd` has no such path in unhashed_args and
+/// is still distributable.)
+#[cfg(feature = "dist-client")]
+fn uses_program_database(parsed_args: &ParsedArguments) -> bool {
+    parsed_args.unhashed_args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.starts_with("/Fd") || arg.starts_with("-Fd")
+    })
+}
+
+/// Whether a parsed MSVC command uses `/d1trimfile`. Like `/pathmap`, its prefix is a
+/// local path that wouldn't match the remote sandbox, and it rides in `unhashed_args`
+/// (which the dist command doesn't forward), so these compiles are cached locally but
+/// not distributed.
+#[cfg(feature = "dist-client")]
+fn uses_trimfile(parsed_args: &ParsedArguments) -> bool {
+    parsed_args.unhashed_args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.starts_with("/d1trimfile:") || arg.starts_with("-d1trimfile:")
     })
 }
 
@@ -4012,6 +4047,65 @@ mod test {
         assert_eq!(Cacheable::No, cacheable);
         // Ensure that we ran all processes.
         assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    /// A `/Zi`+`/Fd` compile routes the PDB path into unhashed_args, which the dist
+    /// command does not forward. Distributing it would silently drop `/Fd` and write
+    /// the default shared PDB instead of the `/Fd` target the cache key assumes, so
+    /// these compiles must be local-only (no dist command).
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_compile_zi_fd_is_local_only() {
+        let f = TestFixture::new();
+        let cwd = f.tempdir.path();
+        let fd = format!("-Fd{}", cwd.join("build").join("f.pdb").display());
+        let args = ovec!["-c", "f.c", "-Zi", &fd, "-Fof.obj"];
+        let parsed_args = match super::parse_arguments(&args, cwd, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        // Sanity: /Fd really did land in unhashed_args (the thing dist drops).
+        assert!(
+            parsed_args
+                .unhashed_args
+                .iter()
+                .any(|a| a.to_string_lossy().starts_with("-Fd"))
+        );
+        let compiler = &f.bins[0];
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_command, dist_command, _cacheable) =
+            generate_compile_commands(&mut path_transformer, compiler, &parsed_args, cwd, &[])
+                .unwrap();
+        assert!(dist_command.is_none());
+    }
+
+    /// A `/d1trimfile` compile routes its per-checkout prefix into unhashed_args, which
+    /// the dist command does not forward. Distributing it would drop the trimming the
+    /// cache key assumes, so these compiles must be local-only (no dist command).
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_compile_d1trimfile_is_local_only() {
+        let f = TestFixture::new();
+        let cwd = f.tempdir.path();
+        let trim = format!("-d1trimfile:{}", cwd.display());
+        let args = ovec!["-c", "f.c", &trim, "-Fof.obj"];
+        let parsed_args = match super::parse_arguments(&args, cwd, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        // Sanity: /d1trimfile really did land in unhashed_args.
+        assert!(
+            parsed_args
+                .unhashed_args
+                .iter()
+                .any(|a| a.to_string_lossy().starts_with("-d1trimfile:"))
+        );
+        let compiler = &f.bins[0];
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_command, dist_command, _cacheable) =
+            generate_compile_commands(&mut path_transformer, compiler, &parsed_args, cwd, &[])
+                .unwrap();
+        assert!(dist_command.is_none());
     }
 
     #[test]
