@@ -1299,16 +1299,25 @@ fn append_pch_creation_state(
     // The /Yc source itself, whose pre-boundary macros are baked into the PCH.
     digest.update(b"\0src\0");
     digest.update(&read_file(&parsed_args.input));
-    // Preprocessor-state args influence the PCH but are not otherwise part of the
-    // object key (they live in preprocessor_args, which the key excludes).
+    // Command-line macro defines/undefs affect the PCH but aren't reflected in the
+    // create-TU's /EP output. Other preprocessor args (/I, /FI, /imsvc, ...) only
+    // select WHICH headers are included, whose contents we hash below; hashing
+    // those (often absolute) paths would defeat SCCACHE_BASEDIRS cross-directory
+    // sharing, so we deliberately skip them.
     for arg in &parsed_args.preprocessor_args {
-        digest.update(b"\0arg\0");
-        digest.update(arg.to_string_lossy().as_bytes());
+        let s = arg.to_string_lossy();
+        if s.starts_with("-D") || s.starts_with("/D") || s.starts_with("-U") || s.starts_with("/U")
+        {
+            digest.update(b"\0def\0");
+            digest.update(s.as_bytes());
+        }
     }
-    // Every header baked into the PCH, by content, in include order.
+    // Every header baked into the PCH, by content, in include order. We hash the
+    // contents only (not the reported paths, which are absolute) so the key is
+    // independent of the checkout directory, matching how SCCACHE_BASEDIRS keeps
+    // the rest of the cache key location-independent.
     for path in includes {
         digest.update(b"\0inc\0");
-        digest.update(path.as_bytes());
         digest.update(&read_file(Path::new(path)));
     }
 

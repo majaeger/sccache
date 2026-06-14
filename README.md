@@ -404,7 +404,7 @@ The following cases intentionally **bypass the cache** (rather than risk an inco
 * A `/Fp` value that names a directory (MSVC then picks a toolset-version default name that cannot be predicted reliably).
 * A `/Yu` whose precompiled header file does not exist yet (the real compile would fail, so caching is refused).
 
-PCH compilations are cached **locally only**; they are not sent to distributed (`sccache-dist`) workers. Because MSVC `.pch` files are not byte-reproducible, a `/Yu` consumer only reuses a cached object when the matching `.pch` is itself restored from the cache (or left in place); a freshly recompiled `.pch` will produce a cache miss. **Clang** and **GCC** precompiled headers (e.g. `-include-pch`) continue to be cached as before.
+PCH compilations are cached **locally only**; they are not sent to distributed (`sccache-dist`) workers. Because MSVC `.pch` files are not byte-reproducible, a `/Yu` consumer only reuses a cached object when the matching `.pch` is itself restored from the cache (or left in place); a freshly recompiled `.pch` will produce a cache miss. The PCH cache key depends on the *contents* of the header tree rather than its absolute location, so the same sources built in different directories (e.g. a repository cloned to multiple paths, or with `SCCACHE_BASEDIRS`) share PCH cache entries. **Clang** and **GCC** precompiled headers (e.g. `-include-pch`) continue to be cached as before.
 
 ### User Agent
 

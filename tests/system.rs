@@ -1193,6 +1193,122 @@ fn test_msvc_pch_use_missing_not_cacheable(compiler: Compiler, tempdir: &Path) {
     });
 }
 
+// The PCH cache key must be independent of the build's absolute location, so the
+// same sources built in two different directories share cache entries (the
+// SCCACHE_BASEDIRS / cloned-repo use case). The compiler reports absolute include
+// paths via /showIncludes, so a naive key would differ per directory; the key must
+// instead depend on header *contents*. A third directory with different header
+// content must NOT collide (no false cross-directory hit).
+fn test_msvc_pch_cross_directory(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_cross_directory: {}", name);
+
+    let make_tree = |dir: &Path, value: u32| {
+        fs::create_dir_all(dir).unwrap();
+        write_source(
+            dir,
+            "config.h",
+            &format!("#pragma once\n#define CD_V {value}\n"),
+        );
+        write_source(
+            dir,
+            "cd_pch.h",
+            "#pragma once\n#include \"config.h\"\nint cd_helper(int);\n",
+        );
+        write_source(dir, "cd_make.cpp", "#include \"cd_pch.h\"\n");
+        write_source(
+            dir,
+            "cd_use.cpp",
+            "#include \"cd_pch.h\"\nint cd_use() { return cd_helper(CD_V); }\n",
+        );
+    };
+    let create = vec_from!(
+        OsString,
+        &exe,
+        "-c",
+        "-EHsc",
+        "-Yccd_pch.h",
+        "-Fpcd.pch",
+        "-Focd_make.obj",
+        "cd_make.cpp"
+    );
+    let use_it = vec_from!(
+        OsString,
+        &exe,
+        "-c",
+        "-EHsc",
+        "-Yucd_pch.h",
+        "-Fpcd.pch",
+        "-Focd_use.obj",
+        "cd_use.cpp"
+    );
+
+    // Two directories at different absolute paths, with identical content.
+    let dir_a = tempdir.join("cross_a");
+    let dir_b = tempdir.join("cross_b");
+    make_tree(&dir_a, 1);
+    make_tree(&dir_b, 1);
+
+    // Build the PCH and a consumer in dir A: both are cold misses.
+    zero_stats();
+    for args in [&create, &use_it] {
+        sccache_command()
+            .args(args.clone())
+            .current_dir(&dir_a)
+            .envs(env_vars.clone())
+            .assert()
+            .success();
+    }
+    get_stats(|info| assert_eq!(2, info.stats.cache_misses.all()));
+
+    // The same content in dir B (a different absolute path) must hit the cache for
+    // both create and use, and the restored .pch must be a real file.
+    zero_stats();
+    for args in [&create, &use_it] {
+        sccache_command()
+            .args(args.clone())
+            .current_dir(&dir_b)
+            .envs(env_vars.clone())
+            .assert()
+            .success();
+    }
+    get_stats(|info| {
+        assert_eq!(
+            2,
+            info.stats.cache_hits.all(),
+            "PCH cache did not share across directories with identical content"
+        );
+    });
+    assert!(
+        fs::metadata(dir_b.join("cd.pch"))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+
+    // A third directory with *different* header content must not collide.
+    let dir_c = tempdir.join("cross_c");
+    make_tree(&dir_c, 2);
+    zero_stats();
+    sccache_command()
+        .args(create.clone())
+        .current_dir(&dir_c)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| {
+        assert_eq!(
+            0,
+            info.stats.cache_hits.all(),
+            "PCH cache wrongly shared across directories with different content"
+        );
+        assert_eq!(1, info.stats.cache_misses.all());
+    });
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -1488,6 +1604,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_pch_disabled_by_y_minus(compiler.clone(), tempdir);
         test_msvc_pch_user_show_includes(compiler.clone(), tempdir);
         test_msvc_pch_use_missing_not_cacheable(compiler.clone(), tempdir);
+        test_msvc_pch_cross_directory(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
