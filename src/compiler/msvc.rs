@@ -659,13 +659,22 @@ pub fn parse_arguments(
                     arg.normalize(NormalizedDisposition::Concatenated)
                         .iter_os_strings(),
                 ),
-            Some(ProgramDatabase(_))
-            | Some(DebugInfo)
+            Some(DebugInfo)
             | Some(PassThrough)
             | Some(PassThroughWithPath(_))
             | Some(PassThroughWithSuffix(_))
             | Some(DisablePch)
             | Some(DynamicDeopt) => common_args.extend(
+                arg.normalize(NormalizedDisposition::Concatenated)
+                    .iter_os_strings(),
+            ),
+            // /Fd names the compiler PDB with a per-checkout absolute path (CMake
+            // emits it under the build tree). Route it to unhashed_args so the path
+            // isn't hashed verbatim (which would defeat cross-directory sharing); a
+            // basedir-normalized form is folded into the key in preprocess() instead
+            // (see append_basedir_path_marker). It can't be fully unhashed like /Fo
+            // because /Fd changes the .obj (it embeds the PDB name+signature).
+            Some(ProgramDatabase(_)) => unhashed_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -966,6 +975,14 @@ pub fn parse_arguments(
         };
     }
 
+    // /Fd's PDB path is folded (basedir-normalized) into the cache key in
+    // preprocess(), which preprocessor-cache (direct) mode would bypass. Disable
+    // direct mode for these compiles, like PCH/pathmap, so two compiles that differ
+    // only in their PDB target can't collide via a stored direct-mode mapping.
+    if outputs.contains_key("pdb") {
+        too_hard_for_preprocessor_cache_mode.get_or_insert_with(|| "-Zi".into());
+    }
+
     // Resolve precompiled-header handling. (/Y- disables /Yc and /Yu; they're still
     // passed to the compiler, which ignores them.)
     if pch.is_active() {
@@ -1225,6 +1242,17 @@ where
             .extend_from_slice(b"\n// sccache-msvc-dynamicdeopt-v1\n");
     }
 
+    // /Fd names the compiler PDB. Its absolute path is per-checkout (CMake emits it
+    // under the build tree), so the flag rides in unhashed_args and here we fold a
+    // basedir-normalized form of the PDB path into the key. Two checkouts writing the
+    // PDB to the same repo-relative location then share, while a different PDB target
+    // stays distinct (it changes the PDB reference embedded in the .obj). Gated on the
+    // "pdb" output (i.e. /Zi + /Fd). Before the early return so it covers plain
+    // (non-PCH) compiles too.
+    if let Some(pdb) = parsed_args.outputs.get("pdb") {
+        append_basedir_path_marker(&mut output.stdout, b"pdb", &pdb.path.to_string_lossy());
+    }
+
     let creating_pch = parsed_args.outputs.contains_key("pch");
     // clang-cl writes its dependency file from the -showIncludes notes (cl.exe uses
     // /sourceDependencies, which the compiler itself handles).
@@ -1351,6 +1379,22 @@ fn write_make_depfile(depfile: &Path, obj: &Path, input: &Path, includes: &[Stri
         }
     }
     Ok(())
+}
+
+/// Fold a per-checkout absolute path argument (e.g. `/Fd`'s PDB path) into the
+/// hashed preprocessor output so SCCACHE_BASEDIRS collapses the checkout-root prefix
+/// while the location-independent remainder (relative path + basename) stays in the
+/// key. The value is emitted with a trailing separator at a line boundary so the
+/// basedir (stored with a trailing separator) strips it -- the same trick as the
+/// `/pathmap` OLD prefix. Two checkouts that point the flag at the same repo-relative
+/// location then share a key; a different target (different relative path or basename)
+/// stays distinct, and a path outside the basedirs is retained verbatim.
+fn append_basedir_path_marker(stdout: &mut Vec<u8>, label: &[u8], value: &str) {
+    stdout.extend_from_slice(b"\n// sccache-msvc-");
+    stdout.extend_from_slice(label);
+    stdout.push(b'\n');
+    stdout.extend_from_slice(value.trim_end_matches(['\\', '/']).as_bytes());
+    stdout.extend_from_slice(b"/\n");
 }
 
 /// Fold MSVC `/pathmap:OLD=NEW;...` mappings (collected in `unhashed_args`) into the
@@ -2430,7 +2474,7 @@ mod test {
             )
         );
         assert!(preprocessor_args.is_empty());
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
+        assert_eq!(common_args, ovec!["-Zi"]);
         assert!(!msvc_show_includes);
     }
 
@@ -2470,7 +2514,7 @@ mod test {
             )
         );
         assert!(preprocessor_args.is_empty());
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo"]);
+        assert_eq!(common_args, ovec!["-Zi"]);
         assert!(!msvc_show_includes);
     }
 
@@ -2510,7 +2554,7 @@ mod test {
             )
         );
         assert!(preprocessor_args.is_empty());
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.pdb"]);
+        assert_eq!(common_args, ovec!["-Zi"]);
         assert!(!msvc_show_includes);
     }
 
@@ -2550,7 +2594,7 @@ mod test {
             )
         );
         assert!(preprocessor_args.is_empty());
-        assert_eq!(common_args, ovec!["-Zi", "-Fdfoo.db"]);
+        assert_eq!(common_args, ovec!["-Zi"]);
         assert!(!msvc_show_includes);
     }
 
@@ -2590,8 +2634,50 @@ mod test {
             )
         );
         assert!(preprocessor_args.is_empty());
-        assert_eq!(common_args, ovec!["-Zi", "-Fdoutput/foo"]);
+        assert_eq!(common_args, ovec!["-Zi"]);
         assert!(!msvc_show_includes);
+    }
+
+    #[test]
+    fn test_parse_arguments_fd_is_unhashed() {
+        // /Fd's PDB path is per-checkout-absolute in real builds, so it must reach the
+        // compiler via unhashed_args (NOT common_args, which is hashed verbatim); a
+        // basedir-normalized form is folded into the key in preprocess() instead, and
+        // direct (preprocessor cache) mode is disabled so that fold can't be bypassed.
+        let cwd = std::env::current_dir().unwrap();
+        let fd = format!("-Fd{}", cwd.join("build").join("f.pdb").display());
+        let args = ovec!["-c", "f.c", "-Zi", &fd, "-Fof.obj"];
+        let parsed = match super::parse_arguments(&args, &cwd, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(parsed.common_args, ovec!["-Zi"]);
+        assert_eq!(parsed.unhashed_args.len(), 1);
+        assert_eq!(parsed.unhashed_args[0].to_string_lossy(), fd);
+        assert!(parsed.outputs.contains_key("pdb"));
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    #[test]
+    fn test_fd_pdb_folds_basedir_normalized() {
+        // The /Fd PDB-path fold + SCCACHE_BASEDIRS stripping must make two checkouts
+        // writing the PDB to the same repo-relative location hash identically, while a
+        // different PDB target stays distinct. Lowercase forward-slash paths keep the
+        // check platform-independent (strip_basedirs only case/slash-normalizes on
+        // Windows).
+        let fold = |path: &str, base: &str| {
+            let mut buf = Vec::new();
+            append_basedir_path_marker(&mut buf, b"pdb", path);
+            crate::util::strip_basedirs(&buf, &[base.as_bytes().to_vec()]).into_owned()
+        };
+        let a = fold("/repo/clone_a/build/f.pdb", "/repo/clone_a/");
+        let b = fold("/repo/clone_b/build/f.pdb", "/repo/clone_b/");
+        assert_eq!(
+            a, b,
+            "same repo-relative PDB path must share after root stripping"
+        );
+        let c = fold("/repo/clone_a/build/other.pdb", "/repo/clone_a/");
+        assert_ne!(a, c, "a different PDB target must stay distinct");
     }
 
     #[test]

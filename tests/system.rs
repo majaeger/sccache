@@ -1460,6 +1460,87 @@ fn test_msvc_dynamicdeopt_companion_obj(compiler: Compiler, tempdir: &Path) {
     }
 }
 
+// /Zi + a unique /Fd writes debug info to a separate compiler PDB. sccache caches the
+// .obj and .pdb together and restores both on a hit. /Fd's per-checkout path is folded
+// basedir-normalized into the key (not hashed verbatim), so a different PDB target
+// stays distinct while a checkout-root-only difference would share (the cross-checkout
+// normalization is covered by the unit test test_fd_pdb_folds_basedir_normalized; the
+// shared test server has no SCCACHE_BASEDIRS).
+fn test_msvc_zi_pdb(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_zi_pdb: {}", name);
+
+    write_source(tempdir, "zi.cpp", "int zi() { return 11; }\n");
+    let args = |pdb: &str| {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-Zi",
+            format!("-Fd{pdb}"),
+            "-Fozi.obj",
+            "zi.cpp"
+        )
+    };
+
+    // Cold compile: a miss that writes zi.obj and the PDB.
+    zero_stats();
+    sccache_command()
+        .args(args("zi.pdb"))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_misses.all()));
+    assert!(
+        fs::metadata(tempdir.join("zi.pdb"))
+            .map(|m| m.len() > 0)
+            .unwrap()
+    );
+
+    // Remove both outputs; the rebuild hits and restores the object AND the PDB.
+    fs::remove_file(tempdir.join("zi.obj")).unwrap();
+    fs::remove_file(tempdir.join("zi.pdb")).unwrap();
+    zero_stats();
+    sccache_command()
+        .args(args("zi.pdb"))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    get_stats(|info| assert_eq!(1, info.stats.cache_hits.all()));
+    assert!(
+        fs::metadata(tempdir.join("zi.obj"))
+            .map(|m| m.len() > 0)
+            .unwrap(),
+        "object not restored from cache"
+    );
+    assert!(
+        fs::metadata(tempdir.join("zi.pdb"))
+            .map(|m| m.len() > 0)
+            .unwrap(),
+        "PDB not restored from cache"
+    );
+
+    // A different PDB target changes the .obj's embedded PDB reference, so it must not
+    // collide with the cached entry.
+    zero_stats();
+    sccache_command()
+        .args(args("other.pdb"))
+        .current_dir(tempdir)
+        .envs(env_vars)
+        .assert()
+        .success();
+    get_stats(|info| {
+        assert_eq!(0, info.stats.cache_hits.all());
+        assert_eq!(1, info.stats.cache_misses.all());
+    });
+}
+
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
     let Compiler {
         name,
@@ -1758,6 +1839,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_pch_cross_directory(compiler.clone(), tempdir);
         test_msvc_pathmap(compiler.clone(), tempdir);
         test_msvc_dynamicdeopt_companion_obj(compiler.clone(), tempdir);
+        test_msvc_zi_pdb(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);
