@@ -396,14 +396,15 @@ The following module-related flags are **not supported** and will bypass the cac
 
 ### Precompiled headers
 
-sccache caches **MSVC** (`cl.exe` and `clang-cl`) compilations that create (`/Yc`) or use (`/Yu`) a precompiled header, including the `/Fp` PCH-path flag. Creating a PCH caches both the object file and the `.pch`. Using a PCH is handled like Clang's `-include-pch`: correctness comes from the preprocessed source (which already contains the expanded header), so the cache key does not depend on the non-reproducible `.pch` binary and a freshly rebuilt `.pch` does not cause spurious misses.
+sccache caches **MSVC** (`cl.exe` and `clang-cl`) compilations that create (`/Yc`) or use (`/Yu`) a precompiled header, including the `/Fp` PCH-path flag. Creating a PCH caches both the object file and the `.pch`; using a PCH content-hashes the consumed `.pch` so that the cache key tracks the exact header binary.
 
 The following cases intentionally **bypass the cache** (rather than risk an incorrect result):
 
 * The header-less `/Yc` / `/Yu` forms that rely on `#pragma hdrstop` to mark the PCH boundary.
 * A `/Fp` value that names a directory (MSVC then picks a toolset-version default name that cannot be predicted reliably).
+* A `/Yu` whose precompiled header file does not exist yet (the real compile would fail, so caching is refused).
 
-Using a PCH (`/Yu`) can be cached and **distributed** (`sccache-dist`), since the remote worker compiles the already-expanded preprocessed source and does not need the `.pch`. Creating a PCH (`/Yc`) is cached **locally only**: the preprocessed source no longer contains the `#include` that `/Yc` needs to locate the PCH boundary, so it cannot be built remotely. As with Clang, a `/Yu` compile relies on the build system to rebuild the `.pch` when the header changes. **Clang** and **GCC** precompiled headers (e.g. `-include-pch`) continue to be cached as before.
+PCH compilations are cached **locally only**; they are not sent to distributed (`sccache-dist`) workers. Because MSVC `.pch` files are not byte-reproducible, a `/Yu` consumer only reuses a cached object when the matching `.pch` is itself restored from the cache (or left in place); a freshly recompiled `.pch` will produce a cache miss. **Clang** and **GCC** precompiled headers (e.g. `-include-pch`) continue to be cached as before.
 
 ### User Agent
 

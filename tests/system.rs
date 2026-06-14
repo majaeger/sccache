@@ -565,7 +565,7 @@ fn test_msvc_pch(compiler: Compiler, tempdir: &Path) {
     sccache_command()
         .args(use_args())
         .current_dir(tempdir)
-        .envs(env_vars.clone())
+        .envs(env_vars)
         .assert()
         .success();
     // The cached .pch and both objects are restored.
@@ -590,32 +590,116 @@ fn test_msvc_pch(compiler: Compiler, tempdir: &Path) {
         assert_eq!(2, info.stats.cache_misses.all());
         assert_eq!(&2, info.stats.cache_hits.get("C/C++").unwrap());
     });
+}
 
-    // Delete the .pch and the consumer object, then recompile *only* the /Yu
-    // consumer without first rebuilding the PCH. Because correctness comes from the
-    // preprocessed source (not the .pch binary), this still hits the cache - the
-    // clang-consistent behavior that avoids spurious misses from non-reproducible
-    // .pch files.
-    fs::remove_file(tempdir.join(use_obj)).unwrap();
-    fs::remove_file(tempdir.join(pch)).unwrap();
+// Regression test: an MSVC PCH can bake in preprocessor state defined *before*
+// the PCH header in the /Yc source. That state is invisible to `cl /EP /Yu`
+// output, so two /Yu compiles that differ only in which .pch they consume (via
+// /Fp) must NOT share a cache entry. This guards against treating MSVC PCH like
+// clang's -include-pch (relying on preprocessed source), which produced a
+// wrong-hit here. See the /Yu handling in src/compiler/msvc.rs.
+fn test_msvc_pch_hidden_macro_state(compiler: Compiler, tempdir: &Path) {
+    let Compiler {
+        name,
+        exe,
+        env_vars,
+    } = compiler;
+    println!("test_msvc_pch_hidden_macro_state: {}", name);
+    zero_stats();
+
+    // An empty header, plus two /Yc sources that define a macro *before* the
+    // header boundary - so each .pch bakes in a different value of PCH_VALUE.
+    write_source(tempdir, "hidden.h", "#pragma once\n");
+    write_source(
+        tempdir,
+        "make_a.cpp",
+        "#define PCH_VALUE 1\n#include \"hidden.h\"\n",
+    );
+    write_source(
+        tempdir,
+        "make_b.cpp",
+        "#define PCH_VALUE 2\n#include \"hidden.h\"\n",
+    );
+    // The consumer references PCH_VALUE, which it does NOT define itself; the
+    // value comes from whichever .pch is used. `cl /EP` leaves it unexpanded.
+    write_source(
+        tempdir,
+        "use_hidden.cpp",
+        "#include \"hidden.h\"\nint hidden_value() { return PCH_VALUE; }\n",
+    );
+
+    let create = |src: &str, pch: &str, obj: &str| {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Ychidden.h",
+            format!("-Fp{pch}"),
+            format!("-Fo{obj}"),
+            src
+        )
+    };
+    let use_with = |pch: &str, obj: &str| {
+        vec_from!(
+            OsString,
+            &exe,
+            "-c",
+            "-EHsc",
+            "-Yuhidden.h",
+            format!("-Fp{pch}"),
+            format!("-Fo{obj}"),
+            "use_hidden.cpp"
+        )
+    };
+
+    // Build the two distinct PCHs.
+    for args in [
+        create("make_a.cpp", "a.pch", "make_a.obj"),
+        create("make_b.cpp", "b.pch", "make_b.obj"),
+    ] {
+        sccache_command()
+            .args(args)
+            .current_dir(tempdir)
+            .envs(env_vars.clone())
+            .assert()
+            .success();
+    }
+
+    // Compile the same consumer source against each PCH. These differ only in
+    // /Fp, and their preprocessed output is identical, but the resulting objects
+    // must differ - so the second compile must be a MISS, not a wrong hit.
     zero_stats();
     sccache_command()
-        .args(use_args())
+        .args(use_with("a.pch", "use_a.obj"))
+        .current_dir(tempdir)
+        .envs(env_vars.clone())
+        .assert()
+        .success();
+    sccache_command()
+        .args(use_with("b.pch", "use_b.obj"))
         .current_dir(tempdir)
         .envs(env_vars)
         .assert()
         .success();
-    assert!(
-        fs::metadata(tempdir.join(use_obj))
-            .map(|m| m.len() > 0)
-            .unwrap()
-    );
+
     get_stats(|info| {
-        assert_eq!(1, info.stats.compile_requests);
-        assert_eq!(1, info.stats.cache_hits.all());
-        assert_eq!(0, info.stats.cache_misses.all());
-        assert_eq!(&1, info.stats.cache_hits.get("C/C++").unwrap());
+        assert_eq!(2, info.stats.compile_requests);
+        assert_eq!(
+            0,
+            info.stats.cache_hits.all(),
+            "second /Yu compile wrongly hit the cache despite a different PCH"
+        );
+        assert_eq!(2, info.stats.cache_misses.all());
     });
+
+    // And prove it at the byte level: the two objects must not be identical.
+    let a = fs::read(tempdir.join("use_a.obj")).unwrap();
+    let b = fs::read(tempdir.join("use_b.obj")).unwrap();
+    assert_ne!(
+        a, b,
+        "objects from different PCHs are identical - PCH content was not hashed"
+    );
 }
 
 fn test_gcc_mp_werror(compiler: Compiler, tempdir: &Path) {
@@ -905,6 +989,7 @@ fn run_sccache_command_tests(compiler: Compiler, tempdir: &Path, preprocessor_ca
         test_msvc_deps(compiler.clone(), tempdir);
         test_msvc_responsefile(compiler.clone(), tempdir);
         test_msvc_pch(compiler.clone(), tempdir);
+        test_msvc_pch_hidden_macro_state(compiler.clone(), tempdir);
     }
     if compiler.name == "gcc" {
         test_gcc_mp_werror(compiler.clone(), tempdir);

@@ -547,9 +547,6 @@ pub fn parse_arguments(
     let mut pch_use = false;
     let mut pch_path_arg: Option<PathBuf> = None;
     let mut pch_disabled = false;
-    // The /Yc|/Yu|/Fp flags, held until we know whether they belong with the
-    // compiler args (create) or the preprocessor args (use); see below.
-    let mut pch_flag_args: Vec<OsString> = vec![];
     let mut xclangs: Vec<OsString> = vec![];
     let mut clangs: Vec<OsString> = vec![];
     let mut profile_generate = false;
@@ -642,16 +639,10 @@ pub fn parse_arguments(
             | Some(PassThrough)
             | Some(PassThroughWithPath(_))
             | Some(PassThroughWithSuffix(_))
+            | Some(ProducePch(_))
+            | Some(UsePch(_))
+            | Some(PchPath(_))
             | Some(DisablePch) => common_args.extend(
-                arg.normalize(NormalizedDisposition::Concatenated)
-                    .iter_os_strings(),
-            ),
-            // Hold /Yc, /Yu and /Fp until parsing finishes: /Yc + /Fp belong with
-            // the compiler args, but /Yu + /Fp must travel with the preprocessor
-            // args so they are excluded from the distributed compile command (whose
-            // input is the already-expanded preprocessed source), mirroring how
-            // clang's -include-pch is handled.
-            Some(ProducePch(_)) | Some(UsePch(_)) | Some(PchPath(_)) => pch_flag_args.extend(
                 arg.normalize(NormalizedDisposition::Concatenated)
                     .iter_os_strings(),
             ),
@@ -909,8 +900,9 @@ pub fn parse_arguments(
     }
 
     // Resolve precompiled header (PCH) handling. /Y- disables all PCH options, so
-    // when present we treat /Yc and /Yu as no-ops (still passed through to the
-    // compiler, which ignores them).
+    // when present we treat /Yc and /Yu as no-ops (they are still passed through to
+    // the compiler, which ignores them).
+    let mut too_hard_for_preprocessor_cache_mode = None;
     if !pch_disabled && (pch_create || pch_use) {
         if pch_create && pch_use {
             cannot_cache!("both /Yc and /Yu");
@@ -921,26 +913,25 @@ pub fn parse_arguments(
         if header.as_os_str().is_empty() {
             cannot_cache!("precompiled header without a header name");
         }
-        if pch_create {
-            // Determine where the .pch lives. With /Fp it's the given path
-            // (defaulting the extension to .pch); without /Fp, MSVC names it
-            // <header-stem>.pch.
-            let pch_path = match &pch_path_arg {
-                Some(p) => {
-                    if p.as_os_str().to_string_lossy().ends_with(['\\', '/']) {
-                        // A directory makes MSVC pick a toolset-version default name
-                        // (vcNNN.pch) that we can't reliably predict.
-                        cannot_cache!("precompiled header path is a directory");
-                    }
-                    if p.extension().is_none() {
-                        p.with_extension("pch")
-                    } else {
-                        p.clone()
-                    }
+        // Determine where the .pch lives. With /Fp it's the given path (defaulting
+        // the extension to .pch); without /Fp, MSVC names it <header-stem>.pch.
+        let pch_path = match &pch_path_arg {
+            Some(p) => {
+                if p.as_os_str().to_string_lossy().ends_with(['\\', '/']) {
+                    // A directory makes MSVC pick a toolset-version default name
+                    // (vcNNN.pch) that we can't reliably predict.
+                    cannot_cache!("precompiled header path is a directory");
                 }
-                None => PathBuf::from(header.file_name().unwrap_or(header.as_os_str()))
-                    .with_extension("pch"),
-            };
+                if p.extension().is_none() {
+                    p.with_extension("pch")
+                } else {
+                    p.clone()
+                }
+            }
+            None => PathBuf::from(header.file_name().unwrap_or(header.as_os_str()))
+                .with_extension("pch"),
+        };
+        if pch_create {
             // Creating a PCH also produces an object file (already an output). Cache
             // the .pch next to it so a cache hit restores a usable header. Resolve
             // against `cwd` before comparing so an absolute /Fp can't alias a
@@ -956,21 +947,32 @@ pub fn parse_arguments(
                     optional: false,
                 },
             );
-            // /Yc + /Fp must reach the compiler to create the PCH. (Creating a PCH
-            // is not distributed; see generate_compile_commands.)
-            common_args.extend(pch_flag_args);
+            too_hard_for_preprocessor_cache_mode = Some("-Yc".into());
         } else {
-            // Using a PCH: route /Yu + /Fp with the preprocessor args so they are
-            // excluded from the distributed compile command, matching clang's
-            // -include-pch. Correctness comes from the preprocessed source, which
-            // already contains the expanded header (MSVC ignores /Yu during /EP),
-            // so we don't separately hash the (non-reproducible) .pch binary.
-            preprocessor_args.extend(pch_flag_args);
+            // Using a PCH: the compiler consumes the binary .pch, not the current
+            // header text. Crucially, an MSVC .pch can bake in preprocessor state
+            // (macros, code) that appears *before* the PCH header in the source that
+            // created it (the /Yc translation unit). That state is invisible to the
+            // consumer's `cl /EP /Yu` output (which ignores the PCH and only expands
+            // the `#include`), so the preprocessed source does NOT fully determine
+            // the object. We must therefore fold the .pch *content* into the cache
+            // key. (This is why MSVC PCH can't be treated like clang's -include-pch,
+            // which relies on preprocessed source, and why these compiles are not
+            // distributed: the remote only receives the preprocessed source.)
+            //
+            // A missing PCH would fail the real compile, so refuse to cache rather
+            // than risk a misleading hit from the preprocessed source alone.
+            let abs_pch = if pch_path.is_absolute() {
+                pch_path
+            } else {
+                cwd.join(&pch_path)
+            };
+            if !abs_pch.is_file() {
+                cannot_cache!("precompiled header file not found");
+            }
+            extra_hash_files.push(abs_pch);
+            too_hard_for_preprocessor_cache_mode = Some("-Yu".into());
         }
-    } else {
-        // PCH disabled (or no /Yc /Yu): the flags, if any, are inert; pass them
-        // through to the compiler unchanged.
-        common_args.extend(pch_flag_args);
     }
 
     CompilerArguments::Ok(ParsedArguments {
@@ -992,7 +994,7 @@ pub fn parse_arguments(
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
-        too_hard_for_preprocessor_cache_mode: None,
+        too_hard_for_preprocessor_cache_mode,
     })
 }
 
@@ -1243,13 +1245,10 @@ fn generate_compile_commands(
     #[cfg(not(feature = "dist-client"))]
     let dist_command = None;
     #[cfg(feature = "dist-client")]
-    let dist_command = if creates_precompiled_header(parsed_args) {
-        // Creating a PCH cannot be distributed: the remote compiles the expanded
-        // preprocessed source, which no longer contains the `#include` that /Yc
-        // needs to find the PCH boundary (cl.exe errors C2857). Keep it local.
-        // Using a PCH (/Yu) *is* distributable: /Yu and /Fp travel with the
-        // preprocessor args (so they're excluded here) and the preprocessed source
-        // already contains the expanded header.
+    let dist_command = if uses_precompiled_header(parsed_args) {
+        // Precompiled-header compiles are not safe to distribute yet: a /Yu remote
+        // compile needs the .pch shipped as an input, and a /Yc remote compile from
+        // preprocessed source may not faithfully produce the .pch. Keep them local.
         None
     } else {
         (|| {
@@ -1283,12 +1282,15 @@ fn generate_compile_commands(
     Ok((command, dist_command, cacheable))
 }
 
-/// Whether a parsed MSVC command creates a precompiled header (`/Yc`). Such
-/// compiles are cached locally but not distributed, because the remote worker
-/// only receives the preprocessed source. Using a PCH (`/Yu`) is distributable.
+/// Whether a parsed MSVC command creates (`/Yc`) or uses (`/Yu`) a precompiled
+/// header. Such compiles are cached locally but not distributed.
 #[cfg(feature = "dist-client")]
-fn creates_precompiled_header(parsed_args: &ParsedArguments) -> bool {
+fn uses_precompiled_header(parsed_args: &ParsedArguments) -> bool {
     parsed_args.outputs.contains_key("pch")
+        || parsed_args.common_args.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg.starts_with("-Yu") || arg.starts_with("/Yu")
+        })
 }
 
 /// Iterator that expands @response files in-place.
@@ -2519,12 +2521,11 @@ mod test {
             outputs.get("pch").map(|o| o.path.as_path()),
             Some(Path::new("stdafx.pch"))
         );
-        // /Yc and /Fp are passed through to the compiler (with the compiler args,
-        // since creating a PCH is not distributed).
+        // /Yc and /Fp are passed through to the compiler and hashed.
         assert_eq!(common_args, ovec!["-Ycstdafx.h", "-Fpstdafx.pch"]);
         assert!(extra_hash_files.is_empty());
-        // Direct (preprocessor cache) mode is left enabled, as for clang PCH.
-        assert!(too_hard_for_preprocessor_cache_mode.is_none());
+        // Direct (preprocessor cache) mode is disabled for PCH compiles.
+        assert!(too_hard_for_preprocessor_cache_mode.is_some());
     }
 
     #[test]
@@ -2563,10 +2564,14 @@ mod test {
 
     #[test]
     fn test_parse_arguments_pch_use() {
-        // Using a PCH routes /Yu + /Fp with the preprocessor args (so they are
-        // excluded from the distributed compile command), matching clang's
-        // -include-pch. The .pch binary is not separately hashed; correctness comes
-        // from the preprocessed source, which already contains the expanded header.
+        // Using a PCH requires the .pch file to exist; it is content-hashed.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch")
+            .tempdir()
+            .unwrap();
+        let pch = tempdir.path().join("stdafx.pch");
+        std::fs::write(&pch, b"precompiled header bytes").unwrap();
+
         let args = ovec![
             "-c",
             "-Yustdafx.h",
@@ -2574,7 +2579,7 @@ mod test {
             "-Fofoo.obj",
             "foo.cpp"
         ];
-        let parsed = match parse_arguments(args) {
+        let parsed = match super::parse_arguments(&args, tempdir.path(), false) {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
@@ -2585,39 +2590,30 @@ mod test {
             Some(Path::new("foo.obj"))
         );
         assert!(!parsed.outputs.contains_key("pch"));
-        // /Yu + /Fp travel with the preprocessor args, not the compiler args.
-        assert_eq!(
-            parsed.preprocessor_args,
-            ovec!["-Yustdafx.h", "-Fpstdafx.pch"]
-        );
-        assert!(parsed.common_args.is_empty());
-        // The .pch is not content-hashed.
-        assert!(parsed.extra_hash_files.is_empty());
-        // Direct (preprocessor cache) mode is left enabled, as for clang PCH.
-        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_none());
+        // The consumed PCH is content-hashed.
+        assert!(parsed.extra_hash_files.contains(&pch));
+        assert_eq!(parsed.common_args, ovec!["-Yustdafx.h", "-Fpstdafx.pch"]);
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
     }
 
     #[test]
-    fn test_parse_arguments_pch_use_without_existing_pch_is_cacheable() {
-        // Unlike a content-hash approach, /Yu does not require the .pch to exist at
-        // parse time: the preprocessed source captures the header, and a genuinely
-        // missing PCH simply fails the real compile (which is never cached). This
-        // matches how clang handles -include-pch.
+    fn test_parse_arguments_pch_use_missing_is_not_cacheable() {
+        // A /Yu whose PCH does not exist would fail the real compile, so refuse to
+        // cache rather than risk a misleading hit from preprocessed source alone.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch")
+            .tempdir()
+            .unwrap();
         let args = ovec![
             "-c",
             "-Yustdafx.h",
-            "-Fpdoes_not_exist.pch",
+            "-Fpstdafx.pch",
             "-Fofoo.obj",
             "foo.cpp"
         ];
-        let parsed = match parse_arguments(args) {
-            CompilerArguments::Ok(args) => args,
-            o => panic!("Got unexpected parse result: {:?}", o),
-        };
-        assert!(parsed.extra_hash_files.is_empty());
         assert_eq!(
-            parsed.preprocessor_args,
-            ovec!["-Yustdafx.h", "-Fpdoes_not_exist.pch"]
+            CompilerArguments::CannotCache("precompiled header file not found", None),
+            super::parse_arguments(&args, tempdir.path(), false)
         );
     }
 
@@ -2727,8 +2723,14 @@ mod test {
 
     #[test]
     fn test_parse_arguments_pch_use_clang() {
-        // clang-cl uses the same /Yu + /Fp spellings and is handled identically:
-        // the flags travel with the preprocessor args and the .pch is not hashed.
+        // clang-cl uses the same /Yu + /Fp spellings and also content-hashes the PCH.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch")
+            .tempdir()
+            .unwrap();
+        let pch = tempdir.path().join("stdafx.pch");
+        std::fs::write(&pch, b"precompiled header bytes").unwrap();
+
         let args = ovec![
             "-c",
             "-Yustdafx.h",
@@ -2736,23 +2738,19 @@ mod test {
             "-Fofoo.obj",
             "foo.cpp"
         ];
-        let parsed = match parse_arguments_clang(args) {
+        let parsed = match super::parse_arguments(&args, tempdir.path(), true) {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
         assert!(!parsed.outputs.contains_key("pch"));
-        assert!(parsed.extra_hash_files.is_empty());
-        assert_eq!(
-            parsed.preprocessor_args,
-            ovec!["-Yustdafx.h", "-Fpstdafx.pch"]
-        );
-        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_none());
+        assert!(parsed.extra_hash_files.contains(&pch));
+        assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
     }
 
     #[test]
     fn test_parse_arguments_pch_use_disabled_by_y_minus() {
-        // /Y- disables PCH use: /Yu + /Fp become inert passthrough compiler args
-        // and are not routed to the preprocessor args.
+        // /Y- disables PCH use, so the (otherwise required) precompiled header is
+        // neither hashed nor checked for existence, even when it is missing.
         let args = ovec![
             "-c",
             "-Yustdafx.h",
@@ -2766,7 +2764,6 @@ mod test {
             o => panic!("Got unexpected parse result: {:?}", o),
         };
         assert!(parsed.extra_hash_files.is_empty());
-        assert!(parsed.preprocessor_args.is_empty());
         assert!(parsed.too_hard_for_preprocessor_cache_mode.is_none());
     }
 
