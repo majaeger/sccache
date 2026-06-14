@@ -1137,130 +1137,131 @@ where
 
     let output = run_input_output(cmd, None).await?;
 
-    // When creating a PCH (/Yc), fold the inputs that determine the PCH into the
-    // preprocessor output so they are reflected in the cache key. `cl /EP` does not
-    // emit `#define` directives, so the preprocessed text alone cannot capture
-    // macros (from the source before the PCH boundary, the PCH header, its
-    // transitive includes, or `/D`) that the PCH bakes in for later `/Yu` consumers.
-    // Applies to both cl.exe and clang-cl.
-    if parsed_args.outputs.contains_key("pch") {
-        return Ok(fold_pch_creation_state(
-            output,
-            &parsed_args,
-            &cwd,
-            &includes_prefix,
-        ));
-    }
+    let creating_pch = parsed_args.outputs.contains_key("pch");
+    // clang-cl writes its dependency file from the -showIncludes notes (cl.exe uses
+    // /sourceDependencies, which the compiler itself handles).
+    let clang_depfile = if is_clang {
+        parsed_args
+            .outputs
+            .get("obj")
+            .zip(parsed_args.depfile.as_ref())
+    } else {
+        None
+    };
 
-    if !is_clang {
+    if !creating_pch && clang_depfile.is_none() {
         return Ok(output);
     }
 
-    let parsed_args = &parsed_args;
-    if let (Some(obj), Some(depfile)) = (parsed_args.outputs.get("obj"), &parsed_args.depfile) {
-        let objfile = &obj.path;
-        let f = File::create(cwd.join(depfile))?;
-        let mut f = BufWriter::new(f);
-
-        encode_path(&mut f, objfile)
-            .with_context(|| format!("Couldn't encode objfile filename: '{:?}'", objfile))?;
-        write!(f, ": ")?;
-        encode_path(&mut f, &parsed_args.input)
-            .with_context(|| format!("Couldn't encode input filename: '{:?}'", objfile))?;
-        write!(f, " ")?;
-        let process::Output {
-            status,
-            stdout,
-            stderr: stderr_bytes,
-        } = output;
-        let stderr =
-            from_local_codepage(&stderr_bytes).context("Failed to convert preprocessor stderr")?;
-        let mut deps = HashSet::new();
-        let mut stderr_bytes = vec![];
-        for line in stderr.lines() {
-            if line.starts_with(&includes_prefix) {
-                let dep = normpath(line[includes_prefix.len()..].trim());
-                trace!("included: {}", dep);
-                if deps.insert(dep.clone()) && !dep.contains(' ') {
-                    write!(f, "{} ", dep)?;
-                }
-                if !parsed_args.msvc_show_includes {
-                    continue;
-                }
-            }
-            stderr_bytes.extend_from_slice(line.as_bytes());
-            stderr_bytes.push(b'\n');
-        }
-        writeln!(f)?;
-        // Write extra rules for each dependency to handle
-        // removed files.
-        encode_path(&mut f, &parsed_args.input)
-            .with_context(|| format!("Couldn't encode filename: '{:?}'", parsed_args.input))?;
-        writeln!(f, ":")?;
-        let mut sorted = deps.into_iter().collect::<Vec<_>>();
-        sorted.sort();
-        for dep in sorted {
-            if !dep.contains(' ') {
-                writeln!(f, "{}:", dep)?;
-            }
-        }
-        Ok(process::Output {
-            status,
-            stdout,
-            stderr: stderr_bytes,
-        })
-    } else {
-        Ok(output)
-    }
-}
-
-/// Fold the inputs that determine a PCH (`/Yc`) into the preprocessor output so
-/// they are reflected in the cache key.
-///
-/// `cl /EP` does not emit `#define` directives, so the preprocessed text alone
-/// does not capture macros that the PCH bakes in for later `/Yu` consumers (a
-/// `#define` change in a header would otherwise produce identical preprocessed
-/// output and a stale-PCH cache hit). We hash, in a deterministic order:
-///   * the `/Yc` source file's raw contents (captures pre-boundary macros in it),
-///   * the preprocessor-state args (`/D`, `/U`, `/I`, `/FI`, ...),
-///   * the contents of every header the compiler reported via `/showIncludes`
-///     (captures transitive `#define` changes),
-/// and append the resulting digest to the preprocessor output.
-fn fold_pch_creation_state(
-    output: process::Output,
-    parsed_args: &ParsedArguments,
-    cwd: &Path,
-    includes_prefix: &str,
-) -> process::Output {
-    // Best effort: if we can't decode the include listing, return the output
-    // unchanged (the compile will still run; we just may miss a header change).
+    // Both PCH-state folding (/Yc) and clang-cl depfile generation consume the
+    // include list reported by -showIncludes, so parse it from stderr just once.
     let stderr = match from_local_codepage(&output.stderr) {
         Ok(s) => s,
         Err(e) => {
-            debug!("Failed to decode /showIncludes output: {}", e);
-            return output;
+            // Best effort: without the include listing we can neither fold PCH state
+            // nor write the depfile, but the compile itself can still proceed.
+            debug!("Failed to convert preprocessor stderr: {}", e);
+            return Ok(output);
         }
     };
+    let (includes, filtered_stderr) =
+        parse_show_includes(&stderr, &includes_prefix, parsed_args.msvc_show_includes);
 
-    // Collect the reported include files (in order, de-duplicated) and rebuild the
-    // stderr without the include notes (unless the user asked to see them).
+    if let Some((obj, depfile)) = clang_depfile {
+        write_make_depfile(&cwd.join(depfile), &obj.path, &parsed_args.input, &includes)
+            .with_context(|| format!("Couldn't write dependency file {:?}", depfile))?;
+    }
+
+    let mut stdout = output.stdout;
+    if creating_pch {
+        append_pch_creation_state(&mut stdout, &parsed_args, &cwd, &includes);
+    }
+
+    Ok(process::Output {
+        status: output.status,
+        stdout,
+        stderr: filtered_stderr,
+    })
+}
+
+/// Parse the include files reported by `-showIncludes` from the compiler's stderr,
+/// returning them (in first-seen order, de-duplicated) along with the stderr
+/// rebuilt without the include notes (unless the user asked to see them).
+fn parse_show_includes(
+    stderr: &str,
+    includes_prefix: &str,
+    show_includes: bool,
+) -> (Vec<String>, Vec<u8>) {
     let mut seen = HashSet::new();
     let mut includes = Vec::new();
-    let mut filtered_stderr = Vec::new();
+    let mut filtered = Vec::new();
     for line in stderr.lines() {
-        if line.starts_with(includes_prefix) {
-            let path = line[includes_prefix.len()..].trim().to_string();
-            if seen.insert(path.clone()) {
-                includes.push(path);
+        // An empty prefix would match every line; treat that as "no include info".
+        if !includes_prefix.is_empty() && line.starts_with(includes_prefix) {
+            let dep = normpath(line[includes_prefix.len()..].trim());
+            trace!("included: {}", dep);
+            if seen.insert(dep.clone()) {
+                includes.push(dep);
             }
-            if !parsed_args.msvc_show_includes {
+            if !show_includes {
                 continue;
             }
         }
-        filtered_stderr.extend_from_slice(line.as_bytes());
-        filtered_stderr.push(b'\n');
+        filtered.extend_from_slice(line.as_bytes());
+        filtered.push(b'\n');
     }
+    (includes, filtered)
+}
 
+/// Write a Make-style dependency file recording `obj`'s dependency on `input` and
+/// the given `includes`, plus phony rules so removed headers don't break the build.
+fn write_make_depfile(depfile: &Path, obj: &Path, input: &Path, includes: &[String]) -> Result<()> {
+    let f = File::create(depfile)?;
+    let mut f = BufWriter::new(f);
+
+    encode_path(&mut f, obj)
+        .with_context(|| format!("Couldn't encode objfile filename: '{:?}'", obj))?;
+    write!(f, ": ")?;
+    encode_path(&mut f, input)
+        .with_context(|| format!("Couldn't encode input filename: '{:?}'", input))?;
+    write!(f, " ")?;
+    for dep in includes {
+        if !dep.contains(' ') {
+            write!(f, "{} ", dep)?;
+        }
+    }
+    writeln!(f)?;
+    // Write extra rules for each dependency to handle removed files.
+    encode_path(&mut f, input)
+        .with_context(|| format!("Couldn't encode filename: '{:?}'", input))?;
+    writeln!(f, ":")?;
+    let mut sorted: Vec<&String> = includes.iter().collect();
+    sorted.sort();
+    for dep in sorted {
+        if !dep.contains(' ') {
+            writeln!(f, "{}:", dep)?;
+        }
+    }
+    Ok(())
+}
+
+/// Append a digest of the inputs that determine a PCH (`/Yc`) to the preprocessor
+/// output, so they are reflected in the cache key.
+///
+/// `cl /EP` does not emit `#define` directives, so the preprocessed text alone does
+/// not capture macros that the PCH bakes in for later `/Yu` consumers (a `#define`
+/// change in a header would otherwise produce identical preprocessed output and a
+/// stale-PCH cache hit). We hash, in a deterministic order:
+///   * the `/Yc` source file's raw contents (captures pre-boundary macros in it),
+///   * the preprocessor-state args (`/D`, `/U`, `/I`, `/FI`, ...),
+///   * the contents of every header reported via `/showIncludes`
+///     (captures transitive `#define` changes).
+fn append_pch_creation_state(
+    stdout: &mut Vec<u8>,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    includes: &[String],
+) {
     let read_file = |path: &Path| -> Vec<u8> {
         let abs = if path.is_absolute() {
             path.to_path_buf()
@@ -1285,22 +1286,15 @@ fn fold_pch_creation_state(
         digest.update(arg.to_string_lossy().as_bytes());
     }
     // Every header baked into the PCH, by content, in include order.
-    for path in &includes {
+    for path in includes {
         digest.update(b"\0inc\0");
         digest.update(path.as_bytes());
         digest.update(&read_file(Path::new(path)));
     }
 
-    let mut stdout = output.stdout;
     stdout.extend_from_slice(b"\n// sccache-pch-state:");
     stdout.extend_from_slice(digest.finish().as_bytes());
     stdout.push(b'\n');
-
-    process::Output {
-        status: output.status,
-        stdout,
-        stderr: filtered_stderr,
-    }
 }
 
 fn generate_compile_commands(
