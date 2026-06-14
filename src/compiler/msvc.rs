@@ -1157,9 +1157,14 @@ where
     // include list reported by -showIncludes, so parse it from stderr just once.
     let stderr = match from_local_codepage(&output.stderr) {
         Ok(s) => s,
+        Err(e) if clang_depfile.is_some() => {
+            // A dependency file was requested, so failing to read the includes is a
+            // hard error (matching the pre-refactor behavior).
+            return Err(e).context("Failed to convert preprocessor stderr");
+        }
         Err(e) => {
-            // Best effort: without the include listing we can neither fold PCH state
-            // nor write the depfile, but the compile itself can still proceed.
+            // PCH folding only: best effort. Without the include listing we may miss
+            // a header change, but the compile itself can still proceed.
             debug!("Failed to convert preprocessor stderr: {}", e);
             return Ok(output);
         }
@@ -1187,6 +1192,11 @@ where
 /// Parse the include files reported by `-showIncludes` from the compiler's stderr,
 /// returning them (in first-seen order, de-duplicated) along with the stderr
 /// rebuilt without the include notes (unless the user asked to see them).
+///
+/// The paths are returned exactly as reported (which may be relative to the
+/// compile working directory); callers resolve them. We must not canonicalize here
+/// with `normpath`, because that resolves relative paths against the sccache
+/// process cwd rather than the compile cwd.
 fn parse_show_includes(
     stderr: &str,
     includes_prefix: &str,
@@ -1198,7 +1208,7 @@ fn parse_show_includes(
     for line in stderr.lines() {
         // An empty prefix would match every line; treat that as "no include info".
         if !includes_prefix.is_empty() && line.starts_with(includes_prefix) {
-            let dep = normpath(line[includes_prefix.len()..].trim());
+            let dep = line[includes_prefix.len()..].trim().to_string();
             trace!("included: {}", dep);
             if seen.insert(dep.clone()) {
                 includes.push(dep);
@@ -1216,6 +1226,16 @@ fn parse_show_includes(
 /// Write a Make-style dependency file recording `obj`'s dependency on `input` and
 /// the given `includes`, plus phony rules so removed headers don't break the build.
 fn write_make_depfile(depfile: &Path, obj: &Path, input: &Path, includes: &[String]) -> Result<()> {
+    // Canonicalize (and de-duplicate, preserving order) the reported include paths.
+    let mut seen = HashSet::new();
+    let mut deps = Vec::new();
+    for inc in includes {
+        let dep = normpath(inc);
+        if seen.insert(dep.clone()) {
+            deps.push(dep);
+        }
+    }
+
     let f = File::create(depfile)?;
     let mut f = BufWriter::new(f);
 
@@ -1225,7 +1245,7 @@ fn write_make_depfile(depfile: &Path, obj: &Path, input: &Path, includes: &[Stri
     encode_path(&mut f, input)
         .with_context(|| format!("Couldn't encode input filename: '{:?}'", input))?;
     write!(f, " ")?;
-    for dep in includes {
+    for dep in &deps {
         if !dep.contains(' ') {
             write!(f, "{} ", dep)?;
         }
@@ -1235,7 +1255,7 @@ fn write_make_depfile(depfile: &Path, obj: &Path, input: &Path, includes: &[Stri
     encode_path(&mut f, input)
         .with_context(|| format!("Couldn't encode filename: '{:?}'", input))?;
     writeln!(f, ":")?;
-    let mut sorted: Vec<&String> = includes.iter().collect();
+    let mut sorted: Vec<&String> = deps.iter().collect();
     sorted.sort();
     for dep in sorted {
         if !dep.contains(' ') {
