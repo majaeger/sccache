@@ -2738,11 +2738,11 @@ mod test {
 
     #[test]
     fn test_parse_arguments_d1trimfile_is_unhashed() {
-        // /d1trimfile:<prefix> used to be unrecognized: a slash-prefixed unknown flag
-        // is treated as a raw input ("multiple input files" => non-cacheable). Now it
-        // is recognized and routed to unhashed_args (its per-checkout prefix is folded
-        // basedir-normalized into the key, not hashed verbatim), and it disables direct
-        // mode. The compile stays cacheable.
+        // A slash-prefixed flag sccache doesn't recognize is treated as a raw input
+        // ("multiple input files" => non-cacheable), so /d1trimfile:<prefix> must be
+        // recognized explicitly. Verify it lands in unhashed_args (its per-checkout
+        // prefix folded basedir-normalized into the key, not hashed verbatim) and
+        // disables direct mode, so the compile stays cacheable.
         let cwd = std::env::current_dir().unwrap();
         let trim = format!("/d1trimfile:{}", cwd.display());
         let args = ovec!["-c", "f.c", "-Zi", "-Fdf.pdb", &trim, "-Fof.obj"];
