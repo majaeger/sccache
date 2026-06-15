@@ -1213,7 +1213,7 @@ where
         Ok(s) => s,
         Err(e) if clang_depfile.is_some() => {
             // A dependency file was requested, so failing to read the includes is a
-            // hard error (matching the pre-refactor behavior).
+            // hard error: the depfile can't be written without them.
             return Err(e).context("Failed to convert preprocessor stderr");
         }
         Err(e) => {
