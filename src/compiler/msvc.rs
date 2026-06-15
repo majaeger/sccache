@@ -913,13 +913,11 @@ pub fn parse_arguments(
         }
     }
     let mut too_hard_for_preprocessor_cache_mode = None;
-    // /dynamicdeopt makes the compiler emit a companion "deoptimized" object next
-    // to each .obj (<obj-stem>.alt.obj, e.g. foo.obj -> foo.alt.obj). Linking with
-    // /DYNAMICDEOPT /DEBUG:FULL requires it, so a cache hit that restored only the
-    // primary .obj would break the link (LNK1422 / LNK4312). Cache the companion
-    // too. It is only produced when the optimizer actually deoptimizes code (and
-    // needs /Z7 or /Zi), so it is optional: if absent it is simply not cached or
-    // restored, exactly matching what a real compile leaves behind.
+    // /dynamicdeopt emits a companion <obj-stem>.alt.obj that a later /DYNAMICDEOPT
+    // /DEBUG:FULL link requires, so restoring only the primary .obj on a cache hit
+    // would break the link (LNK1422 / LNK4312) -- cache it too. It only appears when
+    // the optimizer actually deoptimizes (and needs /Z7 or /Zi), so it's optional:
+    // if absent it's simply not cached or restored, matching a real compile.
     if dynamic_deopt {
         if let Some(obj) = outputs.get("obj") {
             let alt_obj = obj.path.with_extension("alt.obj");
@@ -931,12 +929,10 @@ pub fn parse_arguments(
                 },
             );
         }
-        // Disable preprocessor-cache (direct) mode for /dynamicdeopt. The schema
-        // marker that distinguishes new (companion-aware) entries from pre-change
-        // ones lives in the preprocessor output, which direct mode skips -- a stale
-        // direct-mode mapping from an older sccache could otherwise still route to a
-        // .alt.obj-less result. We take the same route PCH does and bypass direct
-        // mode here so the marker is always honored.
+        // The schema marker below (companion-aware vs pre-change entries) lives in
+        // the preprocessor output, which direct mode skips. Disable direct mode --
+        // as PCH does -- so a stale mapping from an older sccache can't still route
+        // to a .alt.obj-less result.
         too_hard_for_preprocessor_cache_mode = Some("-dynamicdeopt".into());
     }
     // -Fd is not taken into account unless -Zi or -ZI are given
@@ -1218,14 +1214,11 @@ where
     // below so it also covers plain (non-PCH) compiles.
     append_pathmap_markers(&mut output.stdout, &parsed_args.unhashed_args);
 
-    // /dynamicdeopt makes cl emit a companion <obj>.alt.obj that older sccache
-    // versions didn't cache. Fold a schema marker into the hashed preprocessor
-    // output so these compiles get a distinct cache key and can't reuse a
-    // pre-change, .alt.obj-less entry (which would restore only the .obj and break
-    // a later /DYNAMICDEOPT link with LNK1422). The argv is unchanged -- the
-    // preprocessor output is the only hash input we can extend without altering it.
-    // This must run before the early return below so it also covers the common
-    // (non-PCH) /dynamicdeopt case.
+    // Fold a schema marker into the hashed preprocessor output so companion-aware
+    // /dynamicdeopt compiles get a distinct key and can't reuse a pre-change,
+    // .alt.obj-less entry from an older sccache (which would break a later link, as
+    // above). The argv is unchanged, so the preprocessor output is the only hash
+    // input we can extend. Runs before the early return so it covers non-PCH compiles.
     if parsed_args.outputs.contains_key("alt_obj") {
         output
             .stdout
