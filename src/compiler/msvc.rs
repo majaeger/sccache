@@ -929,10 +929,10 @@ pub fn parse_arguments(
                 },
             );
         }
-        // The schema marker below (companion-aware vs pre-change entries) lives in
-        // the preprocessor output, which direct mode skips. Disable direct mode --
-        // as PCH does -- so a stale mapping from an older sccache can't still route
-        // to a .alt.obj-less result.
+        // The schema marker below lives in the preprocessor output, which direct
+        // mode skips. Disable direct mode -- as PCH does -- so a stale direct-mode
+        // mapping can't route a /dynamicdeopt compile to a result lacking the
+        // .alt.obj companion.
         too_hard_for_preprocessor_cache_mode = Some("-dynamicdeopt".into());
     }
     // -Fd is not taken into account unless -Zi or -ZI are given
@@ -1214,9 +1214,9 @@ where
     // below so it also covers plain (non-PCH) compiles.
     append_pathmap_markers(&mut output.stdout, &parsed_args.unhashed_args);
 
-    // Fold a schema marker into the hashed preprocessor output so companion-aware
-    // /dynamicdeopt compiles get a distinct key and can't reuse a pre-change,
-    // .alt.obj-less entry from an older sccache (which would break a later link, as
+    // Fold a schema marker into the hashed preprocessor output so a /dynamicdeopt
+    // compile's cache key differs from one computed without companion-awareness --
+    // otherwise it could reuse an .alt.obj-less entry and break a later link (see
     // above). The argv is unchanged, so the preprocessor output is the only hash
     // input we can extend. Runs before the early return so it covers non-PCH compiles.
     if parsed_args.outputs.contains_key("alt_obj") {
