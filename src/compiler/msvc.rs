@@ -1273,13 +1273,12 @@ where
             .extend_from_slice(b"\n// sccache-msvc-dynamicdeopt-v1\n");
     }
 
-    // /Fd names the compiler PDB. Its absolute path is per-checkout (CMake emits it
-    // under the build tree), so the flag rides in unhashed_args and here we fold a
-    // basedir-normalized form of the PDB path into the key. Two checkouts writing the
-    // PDB to the same repo-relative location then share, while a different PDB target
-    // stays distinct (it changes the PDB reference embedded in the .obj). Gated on the
-    // "pdb" output (i.e. /Zi + /Fd). Before the early return so it covers plain
-    // (non-PCH) compiles too.
+    // /Fd's PDB path is per-checkout (CMake emits it under the build tree), so the
+    // flag rides in unhashed_args and we fold a basedir-normalized form of the path
+    // into the key here: two checkouts writing the PDB to the same repo-relative
+    // location share, while a different target stays distinct (it changes the PDB
+    // reference embedded in the .obj). Gated on the "pdb" output (/Zi + /Fd); before
+    // the early return so it covers non-PCH compiles too.
     if let Some(pdb) = parsed_args.outputs.get("pdb") {
         append_basedir_path_marker(&mut output.stdout, b"pdb", &pdb.path.to_string_lossy());
     }
@@ -1611,16 +1610,10 @@ fn generate_compile_commands(
         || uses_program_database(parsed_args)
         || uses_trimfile(parsed_args)
     {
-        // Precompiled-header compiles are not safe to distribute yet: a /Yu remote
-        // compile needs the .pch shipped as an input, and a /Yc remote compile from
-        // preprocessed source may not faithfully produce the .pch. /pathmap compiles
-        // are likewise kept local: its OLD prefix is a local path that wouldn't match
-        // the remote sandbox, so a remote compile couldn't reproduce the remapping
-        // the cache key assumes. A /Zi compile's /Fd PDB path and any /d1trimfile
-        // prefix are the same kind of local path, and both ride in unhashed_args --
-        // which the dist command below does NOT forward -- so a remote compile would
-        // silently drop them (writing the default shared PDB / skipping the path
-        // trimming the cache key assumes). Keep all of these local.
+        // None of these are safe to distribute yet: each carries local state the dist
+        // command (assembled from common_args, NOT unhashed_args) can't reproduce
+        // remotely -- a /Yu's .pch input, or a /pathmap, /Fd, or /d1trimfile path that
+        // wouldn't match the remote sandbox. See the uses_* helpers. Keep them local.
         None
     } else {
         (|| {
@@ -1678,13 +1671,10 @@ fn uses_pathmap(parsed_args: &ParsedArguments) -> bool {
     })
 }
 
-/// Whether a parsed MSVC command carries a `/Fd` (program database / PDB path). When
-/// present it rides in `unhashed_args` (its per-checkout path would otherwise defeat
-/// cross-directory sharing), and the dist command below does NOT forward unhashed_args,
-/// so a remote compile would drop `/Fd` and write the default shared PDB instead of the
-/// `/Fd` target the cache key assumes. These `/Zi`+`/Fd` compiles are cached locally but
-/// not distributed. (A `/Zi` compile WITHOUT `/Fd` has no such path in unhashed_args and
-/// is still distributable.)
+/// Whether a parsed MSVC command carries `/Fd` (a PDB path). It rides in `unhashed_args`,
+/// which the dist command doesn't forward, so a remote compile would drop it and write
+/// the default shared PDB instead of the `/Fd` target the cache key assumes -- hence
+/// local-only. (A `/Zi` compile WITHOUT `/Fd` has no such path and stays distributable.)
 #[cfg(feature = "dist-client")]
 fn uses_program_database(parsed_args: &ParsedArguments) -> bool {
     parsed_args.unhashed_args.iter().any(|arg| {
