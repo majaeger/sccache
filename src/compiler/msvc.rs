@@ -1060,6 +1060,34 @@ pub fn parse_arguments(
             }
             extra_hash_files.push(abs_pch);
             too_hard_for_preprocessor_cache_mode = Some("-Yu".into());
+
+            // Isolated PCH PDB (opt-in): a /Yu consumer built with /Zi normally points
+            // /Fd at the shared PCH PDB, which is non-cacheable (shared, pre-existing).
+            // Give this TU its own PDB named after the object and let
+            // generate_compile_commands seed it from the shared PCH PDB on a miss, so it
+            // caches/restores wholesale like /Z7. Skip a directory /Fd (cl would pick an
+            // unpredictable vcNNN.pdb name we can't isolate).
+            if isolated_pch_pdb_enabled() && outputs.contains_key("pdb") {
+                let fd_concrete = unhashed_args.iter().any(|a| {
+                    let s = a.to_string_lossy();
+                    matches!(
+                        s.strip_prefix("-Fd").or_else(|| s.strip_prefix("/Fd")),
+                        Some(p) if !p.is_empty() && !p.ends_with(['\\', '/'])
+                    )
+                });
+                let obj_path = outputs.get("obj").map(|o| o.path.clone());
+                if let (true, Some(obj_path)) = (fd_concrete, obj_path) {
+                    let mut per_tu = obj_path.into_os_string();
+                    per_tu.push(".pdb");
+                    outputs.insert(
+                        "pdb",
+                        ArtifactDescriptor {
+                            path: per_tu.into(),
+                            optional: false,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -1549,6 +1577,45 @@ fn append_pch_creation_state(
     stdout.push(b'\n');
 }
 
+/// Opt-in (SCCACHE_MSVC_PCH_ISOLATED_PDB): give each `/Yu`+`/Zi` PCH consumer its own
+/// per-TU PDB seeded from the shared PCH PDB, so the consumer (normally non-cacheable
+/// because it writes the shared PDB) becomes cacheable. cl matches a PCH by its PDB
+/// *signature*, not path, so a copy of the PCH PDB at a unique path satisfies the C2859
+/// check while keeping the written PDB unique per TU.
+fn isolated_pch_pdb_enabled() -> bool {
+    std::env::var_os("SCCACHE_MSVC_PCH_ISOLATED_PDB").is_some()
+}
+
+/// In isolated mode `parse_arguments` rewrites a `/Yu`+`/Zi` consumer's cached PDB output
+/// to a per-TU `<obj>.pdb`, leaving the build's shared `/Fd` PDB in `unhashed_args` as the
+/// seed source. Detect that here from the ground-truth signal -- the PDB output equals
+/// `<obj>.pdb` and differs from the `/Fd` path -- and return (shared PCH PDB, per-TU PDB).
+/// Returns `None` when this compile isn't in isolated mode.
+fn isolated_pch_pdb_paths(parsed_args: &ParsedArguments) -> Option<(PathBuf, PathBuf)> {
+    if !isolated_pch_pdb_enabled() {
+        return None;
+    }
+    let obj = &parsed_args.outputs.get("obj")?.path;
+    let per_tu = parsed_args.outputs.get("pdb")?.path.clone();
+    let mut expected = obj.clone().into_os_string();
+    expected.push(".pdb");
+    if per_tu.as_os_str() != expected {
+        return None;
+    }
+    let shared = parsed_args.unhashed_args.iter().find_map(|a| {
+        let s = a.to_string_lossy();
+        s.strip_prefix("-Fd")
+            .or_else(|| s.strip_prefix("/Fd"))
+            .map(PathBuf::from)
+    })?;
+    // If the build already passed the per-TU name as /Fd there's nothing to isolate; the
+    // existing pre-existing-PDB rule handles it.
+    if shared == per_tu {
+        return None;
+    }
+    Some((shared, per_tu))
+}
+
 fn generate_compile_commands(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,
@@ -1569,19 +1636,40 @@ fn generate_compile_commands(
         None => bail!("Missing object file output"),
     };
 
-    // See if this compilation will produce a PDB.
-    let cacheable = parsed_args
-        .outputs
-        .get("pdb")
-        .map_or(Cacheable::Yes, |pdb| {
-            // If the PDB exists, we don't know if it's shared with another
-            // compilation. If it is, we can't cache.
-            if Path::new(&cwd).join(pdb.path.clone()).exists() {
-                Cacheable::No
-            } else {
-                Cacheable::Yes
+    // Isolated PCH PDB mode (opt-in): seed this /Yu+/Zi consumer's own PDB from the
+    // shared PCH PDB so cl compiles without C2859 (it matches the PCH by PDB signature,
+    // not path) yet writes a unique, cacheable PDB. Seeding only matters on a miss, and
+    // this function runs only on the miss path. If we can't seed, fall back to the shared
+    // /Fd uncached -- exactly the pre-isolation behavior, never unsafe.
+    let (cacheable, isolated_fd) = match isolated_pch_pdb_paths(parsed_args) {
+        Some((shared, per_tu)) => match std::fs::copy(cwd.join(&shared), cwd.join(&per_tu)) {
+            Ok(_) => (Cacheable::Yes, Some(per_tu)),
+            Err(e) => {
+                debug!(
+                    "PCH PDB seed {} -> {} failed; not caching this consumer: {}",
+                    shared.display(),
+                    per_tu.display(),
+                    e
+                );
+                (Cacheable::No, None)
             }
-        });
+        },
+        None => {
+            // See if this compilation will produce a PDB we can cache. A pre-existing PDB
+            // may be shared with another compilation, in which case we can't cache.
+            let cacheable = parsed_args
+                .outputs
+                .get("pdb")
+                .map_or(Cacheable::Yes, |pdb| {
+                    if Path::new(&cwd).join(pdb.path.clone()).exists() {
+                        Cacheable::No
+                    } else {
+                        Cacheable::Yes
+                    }
+                });
+            (cacheable, None)
+        }
+    };
 
     let mut fo = OsString::from("-Fo");
     fo.push(out_file);
@@ -1589,7 +1677,21 @@ fn generate_compile_commands(
     let mut arguments: Vec<OsString> = vec![parsed_args.compilation_flag.clone(), fo];
     arguments.extend_from_slice(&parsed_args.preprocessor_args);
     arguments.extend_from_slice(&parsed_args.dependency_args);
-    arguments.extend_from_slice(&parsed_args.unhashed_args);
+    // Point /Fd at the seeded per-TU PDB when isolating; otherwise pass args through.
+    if let Some(per_tu) = &isolated_fd {
+        let mut fd = OsString::from("-Fd");
+        fd.push(per_tu);
+        arguments.extend(parsed_args.unhashed_args.iter().map(|a| {
+            let s = a.to_string_lossy();
+            if s.starts_with("-Fd") || s.starts_with("/Fd") {
+                fd.clone()
+            } else {
+                a.clone()
+            }
+        }));
+    } else {
+        arguments.extend_from_slice(&parsed_args.unhashed_args);
+    }
     arguments.extend_from_slice(&parsed_args.common_args);
     if parsed_args.double_dash_input {
         arguments.push("--".into());
@@ -3282,6 +3384,191 @@ mod test {
         assert!(parsed.common_args.is_empty());
         assert_eq!(parsed.unhashed_args, ovec!["-Yustdafx.h", "-Fpstdafx.pch"]);
         assert!(parsed.too_hard_for_preprocessor_cache_mode.is_some());
+    }
+
+    // Isolated PCH PDB mode (SCCACHE_MSVC_PCH_ISOLATED_PDB): a /Yu+/Zi consumer that the
+    // build points at the shared PCH PDB gets its own per-TU PDB seeded from it, so it
+    // becomes cacheable. The shared args setup used by these tests.
+    fn isolated_pdb_args() -> Vec<OsString> {
+        ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Zi",
+            "-Fdshared.pdb",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ]
+    }
+
+    #[test]
+    fn test_pch_isolated_pdb_off_keeps_shared_pdb() {
+        // Without the opt-in the consumer keeps the shared /Fd PDB as its output (which
+        // generate_compile_commands then treats as non-cacheable; see below).
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        std::fs::write(tempdir.path().join("stdafx.pch"), b"pch").unwrap();
+        let parsed = temp_env::with_var_unset("SCCACHE_MSVC_PCH_ISOLATED_PDB", || {
+            match super::parse_arguments(&isolated_pdb_args(), tempdir.path(), false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            }
+        });
+        assert_eq!(
+            parsed.outputs.get("pdb").map(|o| o.path.as_path()),
+            Some(Path::new("shared.pdb"))
+        );
+    }
+
+    #[test]
+    fn test_pch_isolated_pdb_on_derives_per_tu_pdb() {
+        // With the opt-in the cached PDB output becomes a per-TU <obj>.pdb, while the
+        // shared /Fd stays in unhashed_args as the seed source.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        std::fs::write(tempdir.path().join("stdafx.pch"), b"pch").unwrap();
+        let parsed = temp_env::with_var("SCCACHE_MSVC_PCH_ISOLATED_PDB", Some("1"), || {
+            match super::parse_arguments(&isolated_pdb_args(), tempdir.path(), false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            }
+        });
+        assert_eq!(
+            parsed.outputs.get("pdb").map(|o| o.path.as_path()),
+            Some(Path::new("foo.obj.pdb"))
+        );
+        assert!(
+            parsed
+                .unhashed_args
+                .iter()
+                .any(|a| a.to_string_lossy() == "-Fdshared.pdb")
+        );
+    }
+
+    #[test]
+    fn test_pch_isolated_pdb_directory_fd_not_isolated() {
+        // A directory /Fd (cl picks an unpredictable vcNNN.pdb) can't be isolated, so the
+        // PDB output is left unchanged even with the opt-in.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        std::fs::write(tempdir.path().join("stdafx.pch"), b"pch").unwrap();
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Zi",
+            "-Fdbuild\\",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        let parsed = temp_env::with_var("SCCACHE_MSVC_PCH_ISOLATED_PDB", Some("1"), || {
+            match super::parse_arguments(&args, tempdir.path(), false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            }
+        });
+        assert_ne!(
+            parsed.outputs.get("pdb").map(|o| o.path.as_path()),
+            Some(Path::new("foo.obj.pdb"))
+        );
+    }
+
+    #[test]
+    fn test_pch_isolated_pdb_seed_success_is_cacheable() {
+        // On a miss, generate_compile_commands seeds the per-TU PDB from the shared PCH
+        // PDB and points /Fd at it -> cacheable.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        let cwd = tempdir.path();
+        std::fs::write(cwd.join("stdafx.pch"), b"pch").unwrap();
+        std::fs::write(cwd.join("shared.pdb"), b"PDB-SIGNATURE").unwrap();
+        temp_env::with_var("SCCACHE_MSVC_PCH_ISOLATED_PDB", Some("1"), || {
+            let parsed = match super::parse_arguments(&isolated_pdb_args(), cwd, false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut pt = dist::PathTransformer::new();
+            let (command, _dist, cacheable) =
+                generate_compile_commands(&mut pt, Path::new("cl.exe"), &parsed, cwd, &[]).unwrap();
+            assert_eq!(cacheable, Cacheable::Yes);
+            // The per-TU PDB was seeded from the shared one.
+            assert_eq!(
+                std::fs::read(cwd.join("foo.obj.pdb")).unwrap(),
+                b"PDB-SIGNATURE"
+            );
+            // The compile command targets the per-TU PDB, not the shared one.
+            assert!(
+                command
+                    .arguments
+                    .iter()
+                    .any(|a| a.to_string_lossy() == "-Fdfoo.obj.pdb")
+            );
+            assert!(
+                !command
+                    .arguments
+                    .iter()
+                    .any(|a| a.to_string_lossy() == "-Fdshared.pdb")
+            );
+        });
+    }
+
+    #[test]
+    fn test_pch_isolated_pdb_seed_failure_is_not_cacheable() {
+        // If the shared PCH PDB is missing we can't seed; fall back to the shared /Fd and
+        // refuse to cache (never unsafe), rather than caching a PDB cl never wrote.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        let cwd = tempdir.path();
+        std::fs::write(cwd.join("stdafx.pch"), b"pch").unwrap();
+        temp_env::with_var("SCCACHE_MSVC_PCH_ISOLATED_PDB", Some("1"), || {
+            let parsed = match super::parse_arguments(&isolated_pdb_args(), cwd, false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut pt = dist::PathTransformer::new();
+            let (command, _dist, cacheable) =
+                generate_compile_commands(&mut pt, Path::new("cl.exe"), &parsed, cwd, &[]).unwrap();
+            assert_eq!(cacheable, Cacheable::No);
+            assert!(
+                command
+                    .arguments
+                    .iter()
+                    .any(|a| a.to_string_lossy() == "-Fdshared.pdb")
+            );
+        });
+    }
+
+    #[test]
+    fn test_pch_zi_shared_pdb_off_is_not_cacheable() {
+        // GPT-5.5 must-have: with the opt-in OFF, a /Yu+/Zi consumer pointed at a
+        // pre-existing shared PDB stays non-cacheable (the existing rule).
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        let cwd = tempdir.path();
+        std::fs::write(cwd.join("stdafx.pch"), b"pch").unwrap();
+        std::fs::write(cwd.join("shared.pdb"), b"pdb").unwrap();
+        temp_env::with_var_unset("SCCACHE_MSVC_PCH_ISOLATED_PDB", || {
+            let parsed = match super::parse_arguments(&isolated_pdb_args(), cwd, false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut pt = dist::PathTransformer::new();
+            let (_command, _dist, cacheable) =
+                generate_compile_commands(&mut pt, Path::new("cl.exe"), &parsed, cwd, &[]).unwrap();
+            assert_eq!(cacheable, Cacheable::No);
+        });
     }
 
     #[test]
