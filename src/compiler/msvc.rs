@@ -1411,8 +1411,9 @@ fn append_pch_creation_state(
     // unhashed_args as `/Yc<header>` (kept out of the hashed args because the path is
     // per-checkout); fold a location-independent form (path relative to `cwd`, else
     // basename) so the key stays checkout-relative, while same-basename headers
-    // elsewhere stay disambiguated by the contents above.
-    let boundary_header = parsed_args.unhashed_args.iter().find_map(|arg| {
+    // elsewhere stay disambiguated by the contents above. Scan from the end: a repeated
+    // `/Yc` makes cl honor the last one, matching how parsing overwrites the header.
+    let boundary_header = parsed_args.unhashed_args.iter().rev().find_map(|arg| {
         let s = arg.to_string_lossy();
         s.strip_prefix("/Yc")
             .or_else(|| s.strip_prefix("-Yc"))
@@ -2949,6 +2950,22 @@ mod test {
             .to_lowercase()
             .into_bytes();
         assert_eq!(digest(&abs, &[base]), digest("-Yca.h", &[]));
+
+        // A repeated `/Yc` makes cl honor the LAST one, and parsing overwrites the
+        // header to match; the folded boundary must follow suit, so `-Yca.h -Ycb.h`
+        // keys like `-Ycb.h` alone, not like `-Yca.h`.
+        let digest_two = |yc1: &str, yc2: &str| -> Vec<u8> {
+            let args = ovec!["-c", yc1, yc2, "-Fpout.pch", "-Fofoo.obj", "foo.cpp"];
+            let parsed = match super::parse_arguments(&args, tempdir.path(), false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut out = Vec::new();
+            append_pch_creation_state(&mut out, &parsed, tempdir.path(), &[], &[]);
+            out
+        };
+        assert_eq!(digest_two("-Yca.h", "-Ycb.h"), digest("-Ycb.h", &[]));
+        assert_ne!(digest_two("-Yca.h", "-Ycb.h"), digest("-Yca.h", &[]));
     }
 
     #[test]
