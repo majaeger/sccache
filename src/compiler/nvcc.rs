@@ -159,6 +159,7 @@ impl CCompilerImpl for Nvcc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        _basedirs: &[Vec<u8>],
         may_dist: bool,
         rewrite_includes_only: bool,
         _preprocessor_cache_mode: bool,

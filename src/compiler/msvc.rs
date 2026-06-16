@@ -72,6 +72,7 @@ impl CCompilerImpl for Msvc {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
+        basedirs: &[Vec<u8>],
         may_dist: bool,
         rewrite_includes_only: bool,
         _preprocessor_cache_mode: bool,
@@ -85,6 +86,7 @@ impl CCompilerImpl for Msvc {
             parsed_args,
             cwd,
             env_vars,
+            basedirs,
             may_dist,
             &self.includes_prefix,
             rewrite_includes_only,
@@ -1153,6 +1155,7 @@ pub async fn preprocess<T>(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
+    basedirs: &[Vec<u8>],
     may_dist: bool,
     includes_prefix: &str,
     rewrite_includes_only: bool,
@@ -1233,7 +1236,7 @@ where
 
     let mut stdout = output.stdout;
     if creating_pch {
-        append_pch_creation_state(&mut stdout, &parsed_args, &cwd, &includes);
+        append_pch_creation_state(&mut stdout, &parsed_args, &cwd, &includes, basedirs);
     }
 
     Ok(process::Output {
@@ -1363,6 +1366,7 @@ fn append_pch_creation_state(
     parsed_args: &ParsedArguments,
     cwd: &Path,
     includes: &[String],
+    basedirs: &[Vec<u8>],
 ) {
     let read_file = |path: &Path| -> Vec<u8> {
         let abs = if path.is_absolute() {
@@ -1375,12 +1379,19 @@ fn append_pch_creation_state(
             b"\0sccache-unreadable\0".to_vec()
         })
     };
+    // Generated PCH headers (e.g. CMake's cmake_pch.hxx) embed an *absolute* `#include`
+    // of the real header, so hashing their raw contents would tie the key to the
+    // checkout path. Strip basedirs from each hashed file's content, mirroring how the
+    // preprocessor output is normalized for SCCACHE_BASEDIRS cross-directory sharing.
+    let read_hashable = |path: &Path| -> Vec<u8> {
+        crate::util::strip_basedirs(&read_file(path), basedirs).into_owned()
+    };
 
     let mut digest = Digest::new();
     digest.update(b"sccache-msvc-pch-state-v1");
     // The /Yc source itself, whose pre-boundary macros are baked into the PCH.
     digest.update(b"\0src\0");
-    digest.update(&read_file(&parsed_args.input));
+    digest.update(&read_hashable(&parsed_args.input));
     // Command-line macro defines/undefs affect the PCH but aren't reflected in the
     // create-TU's /EP output. Other preprocessor args (/I, /FI, /imsvc, ...) only
     // select WHICH headers are included, whose contents we hash below; hashing
@@ -1394,13 +1405,12 @@ fn append_pch_creation_state(
             digest.update(s.as_bytes());
         }
     }
-    // Every header baked into the PCH, by content, in include order. We hash the
-    // contents only (not the reported paths, which are absolute) so the key is
-    // independent of the checkout directory, matching how SCCACHE_BASEDIRS keeps
-    // the rest of the cache key location-independent.
+    // Every header baked into the PCH, by content, in include order. Contents are
+    // basedir-stripped (above) so an absolute path embedded in a generated header
+    // doesn't tie the key to the checkout directory.
     for path in includes {
         digest.update(b"\0inc\0");
-        digest.update(&read_file(Path::new(path)));
+        digest.update(&read_hashable(Path::new(path)));
     }
     // The boundary header's identity. `cl /EP` ignores `/Yc`, so two compiles of the
     // same source at different boundaries (`/Yc a.h` vs `/Yc b.h`) produce identical
@@ -2854,6 +2864,51 @@ mod test {
         let mut raw_b = Vec::new();
         append_pathmap_markers(&mut raw_b, &[OsString::from("/pathmap:/repo/clone_b=.")]);
         assert_ne!(raw_a, raw_b);
+    }
+
+    #[test]
+    fn test_pch_state_basedir_strip_shares_cross_clone() {
+        // A generated PCH boundary header (e.g. CMake's cmake_pch.hxx) embeds an
+        // *absolute* `#include` of the real header. The PCH-state digest hashes header
+        // *contents*, so without basedir stripping that absolute path would tie the key
+        // to the checkout directory and defeat cross-clone (SCCACHE_BASEDIRS) sharing.
+        // Two checkouts must produce the same digest once their basedir is stripped, and
+        // differ when it isn't.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch_state")
+            .tempdir()
+            .unwrap();
+        // The /Yc source: identical across checkouts, no embedded path.
+        std::fs::write(tempdir.path().join("foo.cpp"), b"// tu\n").unwrap();
+        // Two generated headers differing only by their checkout-absolute include.
+        let gen_a = tempdir.path().join("gen_a.hxx");
+        let gen_b = tempdir.path().join("gen_b.hxx");
+        std::fs::write(&gen_a, b"#include \"/repo/clone_a/src/lib_pch.h\"\n").unwrap();
+        std::fs::write(&gen_b, b"#include \"/repo/clone_b/src/lib_pch.h\"\n").unwrap();
+
+        let args = ovec!["-c", "-Ycstdafx.h", "-Fpout.pch", "-Fofoo.obj", "foo.cpp"];
+        let parsed = match super::parse_arguments(&args, tempdir.path(), false) {
+            CompilerArguments::Ok(p) => p,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+
+        let digest = |gen_path: &Path, basedirs: &[Vec<u8>]| -> Vec<u8> {
+            let mut out = Vec::new();
+            let includes = vec![gen_path.to_string_lossy().into_owned()];
+            append_pch_creation_state(&mut out, &parsed, tempdir.path(), &includes, basedirs);
+            out
+        };
+
+        // With each checkout's basedir stripped, the embedded absolute include collapses
+        // to the same relative path -> identical digest -> cross-clone cache hit.
+        let a = digest(&gen_a, &[b"/repo/clone_a/".to_vec()]);
+        let b = digest(&gen_b, &[b"/repo/clone_b/".to_vec()]);
+        assert_eq!(a, b, "checkouts must share once their basedir is stripped");
+
+        // Without basedirs the absolute include is hashed verbatim, so the two checkouts
+        // stay distinct -- confirming the contents really are hashed and the strip above
+        // is what unifies them.
+        assert_ne!(digest(&gen_a, &[]), digest(&gen_b, &[]));
     }
 
     #[test]

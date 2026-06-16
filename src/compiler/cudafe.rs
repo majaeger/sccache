@@ -69,6 +69,7 @@ impl CCompilerImpl for CudaFE {
         parsed_args: &ParsedArguments,
         cwd: &Path,
         _env_vars: &[(OsString, OsString)],
+        _basedirs: &[Vec<u8>],
         _may_dist: bool,
         _rewrite_includes_only: bool,
         _preprocessor_cache_mode: bool,
