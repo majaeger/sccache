@@ -1068,13 +1068,9 @@ pub fn parse_arguments(
             // caches/restores wholesale like /Z7. Skip a directory /Fd (cl would pick an
             // unpredictable vcNNN.pdb name we can't isolate).
             if isolated_pch_pdb_enabled() && outputs.contains_key("pdb") {
-                let fd_concrete = unhashed_args.iter().any(|a| {
-                    let s = a.to_string_lossy();
-                    matches!(
-                        s.strip_prefix("-Fd").or_else(|| s.strip_prefix("/Fd")),
-                        Some(p) if !p.is_empty() && !p.ends_with(['\\', '/'])
-                    )
-                });
+                // Isolate only when the *effective* (last) /Fd is a concrete file; a
+                // directory /Fd (cl picks an unpredictable vcNNN.pdb) can't be isolated.
+                let fd_concrete = effective_fd_pdb(&unhashed_args).is_some();
                 let obj_path = outputs.get("obj").map(|o| o.path.clone());
                 if let (true, Some(obj_path)) = (fd_concrete, obj_path) {
                     let mut per_tu = obj_path.into_os_string();
@@ -1586,6 +1582,27 @@ fn isolated_pch_pdb_enabled() -> bool {
     std::env::var_os("SCCACHE_MSVC_PCH_ISOLATED_PDB").is_some()
 }
 
+/// The effective compiler-PDB path cl would use for the given `/Fd` args: the LAST `/Fd`
+/// (cl honors the last; the parser likewise overwrites it), with a default `.pdb`
+/// extension applied exactly as `parse_arguments` does. `None` if there's no `/Fd` or the
+/// effective one is empty or a directory (cl would pick an unpredictable `vcNNN.pdb`).
+fn effective_fd_pdb(unhashed_args: &[OsString]) -> Option<PathBuf> {
+    let raw = unhashed_args.iter().rev().find_map(|a| {
+        let s = a.to_string_lossy();
+        s.strip_prefix("-Fd")
+            .or_else(|| s.strip_prefix("/Fd"))
+            .map(|v| v.to_owned())
+    })?;
+    if raw.is_empty() || raw.ends_with(['\\', '/']) {
+        return None;
+    }
+    let mut path = PathBuf::from(raw);
+    if path.extension().is_none() {
+        path.set_extension("pdb");
+    }
+    Some(path)
+}
+
 /// In isolated mode `parse_arguments` rewrites a `/Yu`+`/Zi` consumer's cached PDB output
 /// to a per-TU `<obj>.pdb`, leaving the build's shared `/Fd` PDB in `unhashed_args` as the
 /// seed source. Detect that here from the ground-truth signal -- the PDB output equals
@@ -1602,12 +1619,9 @@ fn isolated_pch_pdb_paths(parsed_args: &ParsedArguments) -> Option<(PathBuf, Pat
     if per_tu.as_os_str() != expected {
         return None;
     }
-    let shared = parsed_args.unhashed_args.iter().find_map(|a| {
-        let s = a.to_string_lossy();
-        s.strip_prefix("-Fd")
-            .or_else(|| s.strip_prefix("/Fd"))
-            .map(PathBuf::from)
-    })?;
+    // The shared PCH PDB to seed from is the *effective* (last) /Fd, matching what cl
+    // writes and what parse_arguments derived the now-rewritten output from.
+    let shared = effective_fd_pdb(&parsed_args.unhashed_args)?;
     // If the build already passed the per-TU name as /Fd there's nothing to isolate; the
     // existing pre-existing-PDB rule handles it.
     if shared == per_tu {
@@ -3568,6 +3582,76 @@ mod test {
             let (_command, _dist, cacheable) =
                 generate_compile_commands(&mut pt, Path::new("cl.exe"), &parsed, cwd, &[]).unwrap();
             assert_eq!(cacheable, Cacheable::No);
+        });
+    }
+
+    #[test]
+    fn test_pch_isolated_pdb_multiple_fd_last_wins_directory() {
+        // cl honors the LAST /Fd. If the effective (last) /Fd is a directory, we must not
+        // isolate even though an earlier /Fd was a concrete file.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        std::fs::write(tempdir.path().join("stdafx.pch"), b"pch").unwrap();
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Zi",
+            "-Fdold.pdb",
+            "-Fdbuild\\",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        let parsed = temp_env::with_var("SCCACHE_MSVC_PCH_ISOLATED_PDB", Some("1"), || {
+            match super::parse_arguments(&args, tempdir.path(), false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            }
+        });
+        assert_ne!(
+            parsed.outputs.get("pdb").map(|o| o.path.as_path()),
+            Some(Path::new("foo.obj.pdb"))
+        );
+    }
+
+    #[test]
+    fn test_pch_isolated_pdb_multiple_fd_seeds_from_last() {
+        // With several /Fd files, the seed must come from the effective (last) one, which
+        // is the PDB cl actually writes -- not an earlier, stale /Fd.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        let cwd = tempdir.path();
+        std::fs::write(cwd.join("stdafx.pch"), b"pch").unwrap();
+        std::fs::write(cwd.join("old.pdb"), b"OLD-WRONG").unwrap();
+        std::fs::write(cwd.join("actual.pdb"), b"ACTUAL-PCH-SIG").unwrap();
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Zi",
+            "-Fdold.pdb",
+            "-Fdactual.pdb",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        temp_env::with_var("SCCACHE_MSVC_PCH_ISOLATED_PDB", Some("1"), || {
+            let parsed = match super::parse_arguments(&args, cwd, false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut pt = dist::PathTransformer::new();
+            let (_command, _dist, cacheable) =
+                generate_compile_commands(&mut pt, Path::new("cl.exe"), &parsed, cwd, &[]).unwrap();
+            assert_eq!(cacheable, Cacheable::Yes);
+            // Seeded from the LAST /Fd (actual.pdb), not the earlier old.pdb.
+            assert_eq!(
+                std::fs::read(cwd.join("foo.obj.pdb")).unwrap(),
+                b"ACTUAL-PCH-SIG"
+            );
         });
     }
 
