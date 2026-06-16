@@ -111,9 +111,6 @@ pub struct ParsedArguments {
     pub extra_hash_files: Vec<PathBuf>,
     /// Whether or not the `-showIncludes` argument is passed on MSVC
     pub msvc_show_includes: bool,
-    /// For an MSVC `/Yc` (create PCH) compile, the precompiled-header boundary header;
-    /// `None` otherwise.
-    pub pch_create_header: Option<OsString>,
     /// Whether the compilation is generating profiling or coverage data.
     pub profile_generate: bool,
     /// The color mode.

@@ -312,7 +312,6 @@ where
         extra_dist_files: vec![],
         extra_hash_files: vec![],
         msvc_show_includes: false,
-        pch_create_header: None,
         profile_generate: false,
         // FIXME: Implement me.
         color_mode: ColorMode::Auto,
@@ -788,7 +787,6 @@ mod test {
             extra_dist_files: vec![],
             extra_hash_files: vec![],
             msvc_show_includes: false,
-            pch_create_header: None,
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,

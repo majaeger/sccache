@@ -566,7 +566,6 @@ pub fn parse_arguments(
     let mut depfile = None;
     let mut show_includes = false;
     let mut pch = PchArgs::default();
-    let mut pch_create_header: Option<OsString> = None;
     let mut pathmap_present = false;
     let mut xclangs: Vec<OsString> = vec![];
     let mut clangs: Vec<OsString> = vec![];
@@ -986,11 +985,6 @@ pub fn parse_arguments(
                     optional: false,
                 },
             );
-            // Record the boundary header so its (location-independent) identity is
-            // folded into the cache key. The preprocessed text is the same no matter
-            // which `#include` is the boundary, so without this two `/Yc` compiles of
-            // the same source at different boundaries would collide.
-            pch_create_header = Some(header.as_os_str().to_os_string());
             too_hard_for_preprocessor_cache_mode = Some("-Yc".into());
         } else {
             // A /Yu compile consumes the binary .pch, which can bake in preprocessor
@@ -1036,7 +1030,6 @@ pub fn parse_arguments(
         extra_dist_files: vec![],
         extra_hash_files,
         msvc_show_includes: show_includes,
-        pch_create_header,
         profile_generate,
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
@@ -1414,14 +1407,22 @@ fn append_pch_creation_state(
     }
     // The boundary header's identity. `cl /EP` ignores `/Yc`, so two compiles of the
     // same source at different boundaries (`/Yc a.h` vs `/Yc b.h`) produce identical
-    // preprocessed text and would collide without this. Fold a location-independent
-    // form (path relative to `cwd`, else basename) so the key stays checkout-relative;
-    // same-basename headers elsewhere are still disambiguated by the contents above.
-    if let Some(header) = &parsed_args.pch_create_header {
-        let abs = cwd.join(header);
+    // preprocessed text and would collide without this. The boundary rides in
+    // unhashed_args as `/Yc<header>` (kept out of the hashed args because the path is
+    // per-checkout); fold a location-independent form (path relative to `cwd`, else
+    // basename) so the key stays checkout-relative, while same-basename headers
+    // elsewhere stay disambiguated by the contents above.
+    let boundary_header = parsed_args.unhashed_args.iter().find_map(|arg| {
+        let s = arg.to_string_lossy();
+        s.strip_prefix("/Yc")
+            .or_else(|| s.strip_prefix("-Yc"))
+            .map(|h| h.to_owned())
+    });
+    if let Some(header) = boundary_header {
+        let abs = cwd.join(&header);
         let token = match abs.strip_prefix(cwd) {
             Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
-            Err(_) => Path::new(header)
+            Err(_) => Path::new(&header)
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default(),
@@ -2912,6 +2913,45 @@ mod test {
     }
 
     #[test]
+    fn test_pch_state_boundary_header_differentiates_key() {
+        // `cl /EP` ignores `/Yc`, so two compiles of the same source at different PCH
+        // boundaries produce identical preprocessed text; the boundary header (sourced
+        // from the `/Yc<header>` entry in unhashed_args) is folded into the PCH-state
+        // digest so they don't collide. Different boundary -> different key; same
+        // boundary -> same key, regardless of an absolute-vs-relative spelling that
+        // basedir normalization collapses.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_pch_boundary")
+            .tempdir()
+            .unwrap();
+        std::fs::write(tempdir.path().join("foo.cpp"), b"// tu\n").unwrap();
+
+        let digest = |yc: &str, basedirs: &[Vec<u8>]| -> Vec<u8> {
+            let args = ovec!["-c", yc, "-Fpout.pch", "-Fofoo.obj", "foo.cpp"];
+            let parsed = match super::parse_arguments(&args, tempdir.path(), false) {
+                CompilerArguments::Ok(p) => p,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            let mut out = Vec::new();
+            append_pch_creation_state(&mut out, &parsed, tempdir.path(), &[], basedirs);
+            out
+        };
+
+        // Different boundary headers must not collide.
+        assert_ne!(digest("-Yca.h", &[]), digest("-Ycb.h", &[]));
+        // The same boundary is stable.
+        assert_eq!(digest("-Yca.h", &[]), digest("-Yca.h", &[]));
+        // An absolute boundary under a basedir folds to the same token as the bare name
+        // (the fold makes it relative to `cwd`), so two checkouts share.
+        let abs = format!("-Yc{}", tempdir.path().join("a.h").display());
+        let base = format!("{}/", tempdir.path().display())
+            .replace('\\', "/")
+            .to_lowercase()
+            .into_bytes();
+        assert_eq!(digest(&abs, &[base]), digest("-Yca.h", &[]));
+    }
+
+    #[test]
     fn test_parse_arguments_pch_create_default_name() {
         // Without /Fp, MSVC names the PCH after the header: <header-stem>.pch.
         let args = ovec!["-c", "-Ycstdafx.h", "-Fostdafx.obj", "stdafx.cpp"];
@@ -3616,7 +3656,6 @@ mod test {
             extra_dist_files: vec![],
             extra_hash_files: vec![],
             msvc_show_includes: false,
-            pch_create_header: None,
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
@@ -3707,7 +3746,6 @@ mod test {
             extra_dist_files: vec![],
             extra_hash_files: vec![],
             msvc_show_includes: false,
-            pch_create_header: None,
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
