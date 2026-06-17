@@ -267,6 +267,7 @@ ArgData! {
     DepFile(PathBuf),
     ProgramDatabase(PathBuf),
     DebugInfo,
+    EmbeddedDebugInfo, // /Z7 - debug info in the .obj; overrides an earlier /Zi (no PDB).
     PassThrough, // Miscellaneous flags that don't prevent caching.
     PassThroughWithPath(PathBuf), // As above, recognised by prefix.
     PassThroughWithSuffix(OsString), // As above, recognised by prefix.
@@ -416,7 +417,7 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("Yc", PathBuf, Concatenated, ProducePch), // Create a precompiled header.
     msvc_flag!("Yd", PassThrough),
     msvc_take_arg!("Yu", PathBuf, Concatenated, UsePch), // Use a precompiled header.
-    msvc_flag!("Z7", PassThrough), // Add debug info to .obj files.
+    msvc_flag!("Z7", EmbeddedDebugInfo), // Add debug info to .obj files (overrides /Zi).
     msvc_take_arg!("ZH:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_flag!("ZI", DebugInfo), // Implies /FC, which puts absolute paths in error messages -> TooHardFlag?
     msvc_flag!("ZW", PassThrough),
@@ -613,6 +614,10 @@ pub fn parse_arguments(
             Some(DepFile(p)) => depfile = Some(p.clone()),
             Some(ProgramDatabase(p)) => pdb = Some(p.clone()),
             Some(DebugInfo) => debug_info = true,
+            // /Z7 embeds debug info in the .obj and produces no PDB. cl honors the last
+            // debug-format flag, so a /Z7 after /Zi clears the separate-PDB mode (and the
+            // PDB output we would otherwise create) -- the loop sees flags in order.
+            Some(EmbeddedDebugInfo) => debug_info = false,
             Some(ProducePch(header)) => {
                 pch.create = true;
                 pch.header = Some(header.clone());
@@ -664,6 +669,7 @@ pub fn parse_arguments(
                         .iter_os_strings(),
                 ),
             Some(DebugInfo)
+            | Some(EmbeddedDebugInfo)
             | Some(PassThrough)
             | Some(PassThroughWithPath(_))
             | Some(PassThroughWithSuffix(_))
@@ -3546,6 +3552,70 @@ mod test {
         let (_command, _dist, cacheable) =
             generate_compile_commands(&mut pt, Path::new("cl.exe"), &parsed, cwd, &[]).unwrap();
         assert_eq!(cacheable, Cacheable::No);
+    }
+
+    #[test]
+    fn test_zi_then_z7_is_embedded_not_isolated() {
+        // cl honors the last debug-format flag: /Zi then /Z7 is embedded debug info (no
+        // separate PDB). We must not create a PDB output or isolate, and the compile stays
+        // cacheable -- without seeding a spurious per-TU PDB.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        let cwd = tempdir.path();
+        std::fs::write(cwd.join("stdafx.pch"), b"pch").unwrap();
+        std::fs::write(cwd.join("shared.pdb"), b"pdb").unwrap();
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Zi",
+            "-Fdshared.pdb",
+            "-Z7",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        let parsed = match super::parse_arguments(&args, cwd, false) {
+            CompilerArguments::Ok(p) => p,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(!parsed.outputs.contains_key("pdb"));
+        let mut pt = dist::PathTransformer::new();
+        let (_command, _dist, cacheable) =
+            generate_compile_commands(&mut pt, Path::new("cl.exe"), &parsed, cwd, &[]).unwrap();
+        assert_eq!(cacheable, Cacheable::Yes);
+        assert!(!cwd.join("foo.obj.pdb").exists());
+    }
+
+    #[test]
+    fn test_z7_then_zi_is_separate_pdb_isolated() {
+        // The reverse order: /Z7 then /Zi means separate-PDB mode wins, so isolation
+        // applies and the PDB output becomes the per-TU <obj>.pdb.
+        let tempdir = tempfile::Builder::new()
+            .prefix("sccache_iso")
+            .tempdir()
+            .unwrap();
+        let cwd = tempdir.path();
+        std::fs::write(cwd.join("stdafx.pch"), b"pch").unwrap();
+        let args = ovec![
+            "-c",
+            "-Yustdafx.h",
+            "-Fpstdafx.pch",
+            "-Z7",
+            "-Zi",
+            "-Fdshared.pdb",
+            "-Fofoo.obj",
+            "foo.cpp"
+        ];
+        let parsed = match super::parse_arguments(&args, cwd, false) {
+            CompilerArguments::Ok(p) => p,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert_eq!(
+            parsed.outputs.get("pdb").map(|o| o.path.as_path()),
+            Some(Path::new("foo.obj.pdb"))
+        );
     }
 
     #[test]
