@@ -406,6 +406,17 @@ The following cases intentionally **bypass the cache** (rather than risk an inco
 
 PCH compilations are cached **locally only**; they are not sent to distributed (`sccache-dist`) workers. Because MSVC `.pch` files are not byte-reproducible, a `/Yu` consumer only reuses a cached object when the matching `.pch` is itself restored from the cache (or left in place); a freshly recompiled `.pch` will produce a cache miss. The PCH cache key depends on the *contents* of the header tree rather than its absolute location, so the same sources built in different directories (e.g. a repository cloned to multiple paths, or with `SCCACHE_BASEDIRS`) share PCH cache entries.
 
+#### Precompiled headers with `/Zi` (separate PDB debug info)
+
+A `/Yu` consumer compiled with `/Zi` must write to a PDB that carries the precompiled header's PDB signature, or the compiler reports `C2859`. In a normal build every consumer of a target therefore shares one compiler PDB, which sccache cannot cache (a shared, already-existing PDB). When `/Fd` names a concrete PDB file, sccache automatically gives each consumer its own per-object PDB (`<object>.pdb`) seeded from the precompiled header's PDB, so the consumer compiles without `C2859` yet writes a unique PDB that caches and restores like `/Z7`. To use this, give each target a concrete compiler-PDB path, e.g. with CMake:
+
+```cmake
+set_target_properties(mylib PROPERTIES COMPILE_PDB_NAME_DEBUG "mylib")
+```
+
+This is automatic and requires no flag. It applies only to `/Yu` precompiled-header consumers; a `/Fd` that names a *directory* (CMake's default for executable targets, where the compiler picks an unpredictable `vcNNN.pdb`) is left uncached, as are non-PCH `/Zi` compiles that share a PDB. Only the intermediate per-object compiler PDBs change; the final linked program database is complete and correct. If you would rather not have per-object PDBs, use `/Z7` (embedded debug info) instead, as described above.
+
+
 ### User Agent
 
 * Requests sent to your storage option of choice will have a user agent header indicating the current sccache version, e.g. `sccache/0.8.2`.
